@@ -6,6 +6,8 @@
 static char s_api_key[320] = {0};
 static char s_model[64] = M5CLAW_LLM_DEFAULT_MODEL;
 static char s_provider[16] = M5CLAW_LLM_PROVIDER_DEFAULT;
+static char s_custom_host[128] = {0};
+static char s_custom_path[128] = {0};
 
 static void safe_copy(char* dst, size_t sz, const char* src) {
     if (!dst || !sz) return;
@@ -18,17 +20,23 @@ static void safe_copy(char* dst, size_t sz, const char* src) {
 static bool provider_is_openai() { return strcmp(s_provider, "openai") == 0; }
 
 static const char* llm_host() {
+    if (s_custom_host[0]) return s_custom_host;
     return provider_is_openai() ? M5CLAW_LLM_OPENAI_URL : M5CLAW_LLM_ANTHROPIC_URL;
 }
 static const char* llm_path() {
+    if (s_custom_path[0]) return s_custom_path;
     return provider_is_openai() ? M5CLAW_LLM_OPENAI_PATH : M5CLAW_LLM_ANTHROPIC_PATH;
 }
 
-void llm_client_init(const char* api_key, const char* model, const char* provider) {
+void llm_client_init(const char* api_key, const char* model, const char* provider,
+                     const char* custom_host, const char* custom_path) {
     if (api_key && api_key[0]) safe_copy(s_api_key, sizeof(s_api_key), api_key);
     if (model && model[0]) safe_copy(s_model, sizeof(s_model), model);
     if (provider && provider[0]) safe_copy(s_provider, sizeof(s_provider), provider);
-    Serial.printf("[LLM] Init provider=%s model=%s\n", s_provider, s_model);
+    if (custom_host && custom_host[0]) safe_copy(s_custom_host, sizeof(s_custom_host), custom_host);
+    if (custom_path && custom_path[0]) safe_copy(s_custom_path, sizeof(s_custom_path), custom_path);
+    Serial.printf("[LLM] Init provider=%s model=%s host=%s path=%s\n",
+                  s_provider, s_model, llm_host(), llm_path());
 }
 
 void llm_response_free(LlmResponse* resp) {

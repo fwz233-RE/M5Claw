@@ -3,7 +3,7 @@
 
 static Preferences prefs;
 static String ssid, password, ssid2, password2, city;
-static String llmApiKey, llmModel, llmProvider;
+static String llmApiKey, llmModel, llmProvider, llmHost, llmPath;
 static String dashScopeKey, searchKey;
 
 bool Config::load() {
@@ -16,6 +16,8 @@ bool Config::load() {
     llmApiKey    = prefs.getString("llm_key", "");
     llmModel     = prefs.getString("llm_model", "");
     llmProvider  = prefs.getString("llm_prov", "");
+    llmHost      = prefs.getString("llm_host", "");
+    llmPath      = prefs.getString("llm_path", "");
     dashScopeKey = prefs.getString("ds_key", "");
     searchKey    = prefs.getString("srch_key", "");
     prefs.end();
@@ -32,6 +34,8 @@ void Config::save() {
     prefs.putString("llm_key",   llmApiKey);
     prefs.putString("llm_model", llmModel);
     prefs.putString("llm_prov",  llmProvider);
+    prefs.putString("llm_host",  llmHost);
+    prefs.putString("llm_path",  llmPath);
     prefs.putString("ds_key",    dashScopeKey);
     prefs.putString("srch_key",  searchKey);
     prefs.end();
@@ -42,7 +46,7 @@ void Config::reset() {
     prefs.clear();
     prefs.end();
     ssid = password = ssid2 = password2 = city = "";
-    llmApiKey = llmModel = llmProvider = "";
+    llmApiKey = llmModel = llmProvider = llmHost = llmPath = "";
     dashScopeKey = searchKey = "";
 }
 
@@ -54,6 +58,8 @@ const String& Config::getCity()         { return city; }
 const String& Config::getLlmApiKey()    { return llmApiKey; }
 const String& Config::getLlmModel()     { return llmModel; }
 const String& Config::getLlmProvider()  { return llmProvider; }
+const String& Config::getLlmHost()      { return llmHost; }
+const String& Config::getLlmPath()      { return llmPath; }
 const String& Config::getDashScopeKey() { return dashScopeKey; }
 const String& Config::getSearchKey()    { return searchKey; }
 
@@ -65,6 +71,8 @@ void Config::setCity(const String& c)         { city = c; }
 void Config::setLlmApiKey(const String& k)    { llmApiKey = k; }
 void Config::setLlmModel(const String& m)     { llmModel = m; }
 void Config::setLlmProvider(const String& p)  { llmProvider = p; }
+void Config::setLlmHost(const String& h)      { llmHost = h; }
+void Config::setLlmPath(const String& p)      { llmPath = p; }
 void Config::setDashScopeKey(const String& k) { dashScopeKey = k; }
 void Config::setSearchKey(const String& k)    { searchKey = k; }
 

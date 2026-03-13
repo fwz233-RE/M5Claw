@@ -1,6 +1,5 @@
 # Name,    Type, SubType, Offset,   Size
-nvs,       data, nvs,     0x9000,   0x6000
-otadata,   data, ota,     0xF000,   0x2000
-phy_init,  data, phy,     0x11000,  0x1000
-app0,      app,  ota_0,   0x20000,  0x300000
-spiffs,    data, spiffs,  0x320000, 0x4E0000
+nvs,       data, nvs,     0x9000,   0x5000
+otadata,   data, ota,     0xe000,   0x2000
+app0,      app,  factory, 0x10000,  0x300000
+spiffs,    data, spiffs,  0x310000, 0x4F0000

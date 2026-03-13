@@ -18,6 +18,34 @@
 #include "dashscope_tts.h"
 #include <esp_heap_caps.h>
 
+#ifndef USER_WIFI_SSID
+#define USER_WIFI_SSID ""
+#endif
+#ifndef USER_WIFI_PASS
+#define USER_WIFI_PASS ""
+#endif
+#ifndef USER_LLM_KEY
+#define USER_LLM_KEY ""
+#endif
+#ifndef USER_LLM_PROVIDER
+#define USER_LLM_PROVIDER ""
+#endif
+#ifndef USER_LLM_MODEL
+#define USER_LLM_MODEL ""
+#endif
+#ifndef USER_DS_KEY
+#define USER_DS_KEY ""
+#endif
+#ifndef USER_CITY
+#define USER_CITY ""
+#endif
+#ifndef USER_LLM_HOST
+#define USER_LLM_HOST ""
+#endif
+#ifndef USER_LLM_PATH
+#define USER_LLM_PATH ""
+#endif
+
 M5Canvas canvas(&M5Cardputer.Display);
 Companion companion;
 Chat chat;
@@ -52,17 +80,108 @@ void enterChatMode();
 void initVoiceBuffer();
 void startVoiceRecording();
 bool stopVoiceRecording();
+void fillBuildTimeDefaults();
+void processSerialCommands();
 
 static void onAgentResponse(const char* text);
 static volatile bool agentResponseReady = false;
 static char* agentResponseText = nullptr;
 
+static void setIfEmpty(void (*setter)(const String&), const String& current, const char* buildVal) {
+    if (current.length() == 0 && buildVal && buildVal[0])
+        setter(String(buildVal));
+}
+
+void fillBuildTimeDefaults() {
+    setIfEmpty(Config::setSSID,         Config::getSSID(),         USER_WIFI_SSID);
+    setIfEmpty(Config::setPassword,     Config::getPassword(),     USER_WIFI_PASS);
+    setIfEmpty(Config::setLlmApiKey,    Config::getLlmApiKey(),    USER_LLM_KEY);
+    setIfEmpty(Config::setLlmProvider,  Config::getLlmProvider(),  USER_LLM_PROVIDER);
+    setIfEmpty(Config::setLlmModel,     Config::getLlmModel(),     USER_LLM_MODEL);
+    setIfEmpty(Config::setDashScopeKey, Config::getDashScopeKey(), USER_DS_KEY);
+    setIfEmpty(Config::setCity,         Config::getCity(),         USER_CITY);
+    setIfEmpty(Config::setLlmHost,      Config::getLlmHost(),      USER_LLM_HOST);
+    setIfEmpty(Config::setLlmPath,      Config::getLlmPath(),      USER_LLM_PATH);
+    if (Config::getLlmProvider().length() == 0) Config::setLlmProvider("anthropic");
+    if (Config::getLlmModel().length() == 0) Config::setLlmModel(M5CLAW_LLM_DEFAULT_MODEL);
+    if (Config::getCity().length() == 0) Config::setCity("Beijing");
+}
+
+void processSerialCommands() {
+    if (!Serial.available()) return;
+    String line = Serial.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) return;
+
+    int sep = line.indexOf(' ');
+    String cmd = (sep > 0) ? line.substring(0, sep) : line;
+    String val = (sep > 0) ? line.substring(sep + 1) : "";
+    val.trim();
+
+    if (cmd == "help") {
+        Serial.println("=== M5Claw Serial Config ===");
+        Serial.println("  set_wifi <ssid> <pass>   - Set WiFi");
+        Serial.println("  set_llm_key <key>        - Set LLM API key");
+        Serial.println("  set_llm_provider <p>     - anthropic or openai");
+        Serial.println("  set_llm_model <model>    - e.g. claude-sonnet-4-20250514");
+        Serial.println("  set_ds_key <key>         - Set DashScope key");
+        Serial.println("  set_city <city>          - e.g. Beijing");
+        Serial.println("  show_config              - Show current config");
+        Serial.println("  reset_config             - Clear all config");
+        Serial.println("  reboot                   - Restart device");
+    } else if (cmd == "set_wifi") {
+        int sp = val.indexOf(' ');
+        if (sp > 0) {
+            Config::setSSID(val.substring(0, sp));
+            Config::setPassword(val.substring(sp + 1));
+            Config::save();
+            Serial.printf("WiFi set: %s\n", Config::getSSID().c_str());
+        } else {
+            Serial.println("Usage: set_wifi <ssid> <password>");
+        }
+    } else if (cmd == "set_llm_key") {
+        Config::setLlmApiKey(val); Config::save();
+        Serial.println("LLM key saved");
+    } else if (cmd == "set_llm_provider") {
+        Config::setLlmProvider(val); Config::save();
+        Serial.printf("Provider: %s\n", val.c_str());
+    } else if (cmd == "set_llm_model") {
+        Config::setLlmModel(val); Config::save();
+        Serial.printf("Model: %s\n", val.c_str());
+    } else if (cmd == "set_ds_key") {
+        Config::setDashScopeKey(val); Config::save();
+        Serial.println("DashScope key saved");
+    } else if (cmd == "set_city") {
+        Config::setCity(val); Config::save();
+        Serial.printf("City: %s\n", val.c_str());
+    } else if (cmd == "show_config") {
+        Serial.println("=== Current Config ===");
+        Serial.printf("  WiFi SSID:     %s\n", Config::getSSID().c_str());
+        Serial.printf("  WiFi Pass:     [%d chars]\n", Config::getPassword().length());
+        Serial.printf("  LLM Provider:  %s\n", Config::getLlmProvider().c_str());
+        Serial.printf("  LLM Model:     %s\n", Config::getLlmModel().c_str());
+        Serial.printf("  LLM Key:       [%d chars]\n", Config::getLlmApiKey().length());
+        Serial.printf("  DashScope Key: [%d chars]\n", Config::getDashScopeKey().length());
+        Serial.printf("  City:          %s\n", Config::getCity().c_str());
+        Serial.printf("  Valid:         %s\n", Config::isValid() ? "YES" : "NO");
+    } else if (cmd == "reset_config") {
+        Config::reset(); Config::save();
+        Serial.println("Config cleared. Reboot to enter setup.");
+    } else if (cmd == "reboot") {
+        Serial.println("Rebooting...");
+        delay(100);
+        ESP.restart();
+    } else {
+        Serial.printf("Unknown command: %s (type 'help')\n", cmd.c_str());
+    }
+}
+
 void setup() {
     auto cfg = M5.config();
     M5Cardputer.begin(cfg, true);
-    M5Cardputer.Speaker.setVolume(255);
+
     Serial.begin(115200);
-    delay(500);
+    delay(1000);
     Serial.println("[BOOT] M5Claw starting...");
 
     M5Cardputer.Display.setRotation(1);
@@ -70,13 +189,28 @@ void setup() {
     canvas.createSprite(SCREEN_W, SCREEN_H);
     canvas.setTextWrap(false);
 
+    canvas.fillScreen(Color::BLACK);
+    canvas.setTextColor(Color::WHITE);
+    canvas.setTextSize(1);
+    canvas.drawString("M5Claw booting...", 60, 60);
+    canvas.pushSprite(0, 0);
+    Serial.println("[BOOT] Display OK");
+
+    M5Cardputer.Speaker.setVolume(255);
+
     Config::load();
+    fillBuildTimeDefaults();
     Config::save();
+    Serial.println("[BOOT] Config loaded");
+    Serial.println("[BOOT] Type 'help' in serial monitor for config commands");
 
     MemoryStore::init();
+    Serial.println("[BOOT] SPIFFS OK");
+
     SessionMgr::init();
     ToolRegistry::init();
     Agent::init();
+    Serial.println("[BOOT] Agent initialized");
 
     playBootAnimation(canvas);
 
@@ -333,6 +467,7 @@ void loop() {
         }
     }
 
+    processSerialCommands();
     delay(16);
 }
 
@@ -623,7 +758,9 @@ void initOnlineServices() {
 
     llm_client_init(Config::getLlmApiKey().c_str(),
                     Config::getLlmModel().c_str(),
-                    Config::getLlmProvider().c_str());
+                    Config::getLlmProvider().c_str(),
+                    Config::getLlmHost().c_str(),
+                    Config::getLlmPath().c_str());
 
     if (Config::getDashScopeKey().length() > 0) {
         DashScopeSTT::init(Config::getDashScopeKey().c_str());

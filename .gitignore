@@ -10,6 +10,7 @@
 mimi_secrets.h
 *.env
 .env*
+user_config.ini
 
 # Python 缓存
 __pycache__/

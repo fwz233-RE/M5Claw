@@ -16,6 +16,8 @@ namespace Config {
     const String& getLlmApiKey();
     const String& getLlmModel();
     const String& getLlmProvider();
+    const String& getLlmHost();
+    const String& getLlmPath();
 
     // DashScope config (STT + TTS)
     const String& getDashScopeKey();
@@ -31,6 +33,8 @@ namespace Config {
     void setLlmApiKey(const String& key);
     void setLlmModel(const String& model);
     void setLlmProvider(const String& provider);
+    void setLlmHost(const String& host);
+    void setLlmPath(const String& path);
     void setDashScopeKey(const String& key);
     void setSearchKey(const String& key);
 

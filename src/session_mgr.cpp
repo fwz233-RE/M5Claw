@@ -12,9 +12,7 @@ static String sessionPath(const char* chat_id) {
 }
 
 void SessionMgr::init() {
-    if (!SPIFFS.exists(M5CLAW_SESSION_DIR)) {
-        SPIFFS.mkdir(M5CLAW_SESSION_DIR);
-    }
+    // SPIFFS has flat filesystem, no mkdir needed
 }
 
 bool SessionMgr::appendMessage(const char* chat_id, const char* role, const char* content) {
