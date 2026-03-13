@@ -71,7 +71,7 @@ String DashScopeSTT::recognize(const int16_t* samples, size_t sampleCount) {
     char authHeader[384];
     snprintf(authHeader, sizeof(authHeader), "Authorization: Bearer %s", s_api_key);
 
-    s_ws->beginSSL(M5CLAW_STT_WS_HOST, M5CLAW_STT_WS_PORT, M5CLAW_STT_WS_PATH, (const uint8_t*)nullptr);
+    s_ws->beginSSL(M5CLAW_STT_WS_HOST, M5CLAW_STT_WS_PORT, M5CLAW_STT_WS_PATH, "", "");
     s_ws->setExtraHeaders(authHeader);
     s_ws->onEvent(ws_event);
 
