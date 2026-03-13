@@ -1,0 +1,38 @@
+#pragma once
+#include <Arduino.h>
+
+namespace Config {
+    bool load();
+    void save();
+    void reset();
+
+    const String& getSSID();
+    const String& getPassword();
+    const String& getSSID2();
+    const String& getPassword2();
+    const String& getCity();
+
+    // LLM config
+    const String& getLlmApiKey();
+    const String& getLlmModel();
+    const String& getLlmProvider();
+
+    // DashScope config (STT + TTS)
+    const String& getDashScopeKey();
+
+    // Search
+    const String& getSearchKey();
+
+    void setSSID(const String& ssid);
+    void setPassword(const String& password);
+    void setSSID2(const String& ssid);
+    void setPassword2(const String& password);
+    void setCity(const String& city);
+    void setLlmApiKey(const String& key);
+    void setLlmModel(const String& model);
+    void setLlmProvider(const String& provider);
+    void setDashScopeKey(const String& key);
+    void setSearchKey(const String& key);
+
+    bool isValid();
+}

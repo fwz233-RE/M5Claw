@@ -1,0 +1,7 @@
+.pio/
+.vscode/
+mimi_secrets.h
+*.env
+.env*
+__pycache__/
+*.pyc
