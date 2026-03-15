@@ -2,7 +2,6 @@
 #include "m5claw_config.h"
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
-#include <mbedtls/base64.h>
 
 static char s_api_key[320] = {0};
 
@@ -26,18 +25,32 @@ static bool skipHeaders(WiFiClientSecure& client, unsigned long deadline) {
     return false;
 }
 
-// Decode base64 PCM data and append to buffer
-static size_t decodeBase64PCM(const char* b64, size_t b64Len, int16_t* buffer, size_t offset, size_t maxSamples) {
-    size_t outLen = 0;
-    size_t maxBytes = (maxSamples - offset) * sizeof(int16_t);
-    uint8_t* outBuf = (uint8_t*)(buffer + offset);
-
-    int ret = mbedtls_base64_decode(outBuf, maxBytes, &outLen, (const uint8_t*)b64, b64Len);
-    if (ret != 0) {
-        Serial.printf("[TTS] Base64 decode error: %d\n", ret);
-        return 0;
+static int readHttpBody(WiFiClientSecure& client, char* buf, int bufSize, unsigned long deadline) {
+    int len = 0;
+    while (len < bufSize - 1 && millis() < deadline) {
+        if (client.available()) {
+            buf[len++] = client.read();
+        } else if (!client.connected()) {
+            break;
+        } else {
+            delay(1);
+        }
     }
-    return outLen / sizeof(int16_t);
+    buf[len] = '\0';
+    return len;
+}
+
+static bool parseHttpsUrl(const String& url, String& host, String& path) {
+    if (!url.startsWith("https://")) return false;
+    int slash = url.indexOf('/', 8);
+    if (slash < 0) {
+        host = url.substring(8);
+        path = "/";
+    } else {
+        host = url.substring(8, slash);
+        path = url.substring(slash);
+    }
+    return host.length() > 0;
 }
 
 size_t DashScopeTTS::synthesize(const char* text, int16_t* buffer, size_t maxSamples) {
@@ -51,73 +64,99 @@ size_t DashScopeTTS::synthesize(const char* text, int16_t* buffer, size_t maxSam
         return 0;
     }
 
-    // Build JSON body
     JsonDocument doc;
     doc["model"] = M5CLAW_TTS_MODEL;
     doc["input"]["text"] = text;
     doc["input"]["voice"] = M5CLAW_TTS_VOICE;
     doc["input"]["language_type"] = "Chinese";
+    doc["stream"] = false;
     String body;
     serializeJson(doc, body);
 
-    // Send request with SSE header for streaming
     client.printf("POST %s HTTP/1.1\r\n", M5CLAW_TTS_PATH);
     client.printf("Host: %s\r\n", M5CLAW_TTS_HOST);
     client.printf("Authorization: Bearer %s\r\n", s_api_key);
     client.println("Content-Type: application/json");
-    client.println("X-DashScope-SSE: enable");
     client.printf("Content-Length: %d\r\n", body.length());
     client.println("Connection: close");
     client.println();
     client.print(body);
 
     unsigned long deadline = millis() + 30000;
-
     if (!skipHeaders(client, deadline)) {
         Serial.println("[TTS] Header timeout");
         client.stop();
         return 0;
     }
 
-    // Read SSE stream and extract base64 audio data
-    size_t totalSamples = 0;
+    char jsonBuf[4096];
+    int jsonLen = readHttpBody(client, jsonBuf, sizeof(jsonBuf), deadline);
+    client.stop();
 
-    while (client.connected() && millis() < deadline) {
-        if (!client.available()) { delay(1); continue; }
-
-        String line = client.readStringUntil('\n');
-        line.trim();
-
-        if (line.startsWith("data:")) {
-            String data = line.substring(5);
-            data.trim();
-            if (data.length() == 0) continue;
-
-            JsonDocument eventDoc;
-            if (deserializeJson(eventDoc, data) != DeserializationError::Ok) continue;
-
-            JsonObject output = eventDoc["output"];
-            if (output.isNull()) continue;
-
-            JsonObject audio = output["audio"];
-            if (audio.isNull()) continue;
-
-            const char* audioData = audio["data"] | "";
-            if (audioData[0] && totalSamples < maxSamples) {
-                size_t decoded = decodeBase64PCM(audioData, strlen(audioData),
-                                                  buffer, totalSamples, maxSamples);
-                totalSamples += decoded;
-            }
-
-            const char* finishReason = output["finish_reason"] | "";
-            if (strcmp(finishReason, "stop") == 0) {
-                Serial.println("[TTS] Synthesis complete");
-                break;
-            }
-        }
+    if (jsonLen <= 0) {
+        Serial.println("[TTS] Empty response");
+        return 0;
     }
 
-    client.stop();
-    Serial.printf("[TTS] Synthesized %d samples\n", (int)totalSamples);
+    JsonDocument respDoc;
+    if (deserializeJson(respDoc, jsonBuf, jsonLen) != DeserializationError::Ok) {
+        Serial.println("[TTS] Failed to parse JSON response");
+        return 0;
+    }
+
+    const char* audioUrl = respDoc["output"]["audio"]["url"] | "";
+    if (!audioUrl[0]) {
+        Serial.println("[TTS] No audio URL in response");
+        return 0;
+    }
+
+    String host, path;
+    if (!parseHttpsUrl(String(audioUrl), host, path)) {
+        Serial.println("[TTS] Invalid audio URL");
+        return 0;
+    }
+
+    WiFiClientSecure audioClient;
+    audioClient.setInsecure();
+    if (!audioClient.connect(host.c_str(), 443)) {
+        Serial.println("[TTS] Audio download connect failed");
+        return 0;
+    }
+
+    audioClient.printf("GET %s HTTP/1.1\r\n", path.c_str());
+    audioClient.printf("Host: %s\r\n", host.c_str());
+    audioClient.println("Connection: close");
+    audioClient.println();
+
+    deadline = millis() + 30000;
+    if (!skipHeaders(audioClient, deadline)) {
+        Serial.println("[TTS] Audio header timeout");
+        audioClient.stop();
+        return 0;
+    }
+
+    size_t maxBytes = maxSamples * sizeof(int16_t);
+    uint8_t* rawBuf = (uint8_t*)buffer;
+    size_t totalBytes = 0;
+    while (totalBytes < maxBytes && millis() < deadline) {
+        if (audioClient.available()) {
+            rawBuf[totalBytes++] = audioClient.read();
+        } else if (!audioClient.connected()) {
+            break;
+        } else {
+            delay(1);
+        }
+    }
+    audioClient.stop();
+
+    if (totalBytes <= 44) {
+        Serial.println("[TTS] Audio data too short");
+        return 0;
+    }
+
+    memmove(rawBuf, rawBuf + 44, totalBytes - 44);
+    size_t pcmBytes = totalBytes - 44;
+    size_t totalSamples = pcmBytes / sizeof(int16_t);
+    Serial.printf("[TTS] Downloaded %d samples from URL\n", (int)totalSamples);
     return totalSamples;
 }

@@ -28,6 +28,10 @@ static const char* llm_path() {
     return provider_is_openai() ? M5CLAW_LLM_OPENAI_PATH : M5CLAW_LLM_ANTHROPIC_PATH;
 }
 
+static bool provider_is_minimax_compatible() {
+    return strstr(llm_host(), "minimax") != nullptr;
+}
+
 void llm_client_init(const char* api_key, const char* model, const char* provider,
                      const char* custom_host, const char* custom_path) {
     if (api_key && api_key[0]) safe_copy(s_api_key, sizeof(s_api_key), api_key);
@@ -79,6 +83,40 @@ static int read_http_body(WiFiClientSecure& client, char* buf, int bufSize, unsi
     }
     buf[len] = '\0';
     return len;
+}
+
+static void decode_chunked_in_place(char* buf, int* len) {
+    if (!buf || !len || *len <= 0) return;
+
+    int i = 0;
+    while (i < *len && (buf[i] == ' ' || buf[i] == '\t' || buf[i] == '\r' || buf[i] == '\n')) i++;
+    if (i < *len && (buf[i] == '{' || buf[i] == '[')) return;
+
+    char* src = buf;
+    char* dst = buf;
+    char* end = buf + *len;
+
+    while (src < end) {
+        char* line_end = strstr(src, "\r\n");
+        if (!line_end) break;
+
+        unsigned long chunk_size = strtoul(src, nullptr, 16);
+        if (chunk_size == 0) break;
+
+        src = line_end + 2;
+        if (src + chunk_size > end) break;
+
+        memmove(dst, src, chunk_size);
+        dst += chunk_size;
+        src += chunk_size;
+
+        if (src + 2 <= end && src[0] == '\r' && src[1] == '\n') {
+            src += 2;
+        }
+    }
+
+    *len = (int)(dst - buf);
+    buf[*len] = '\0';
 }
 
 static void build_anthropic_body(JsonDocument& doc, const char* system_prompt,
@@ -260,6 +298,9 @@ bool llm_chat_tools(const char* system_prompt,
         client.printf("Authorization: Bearer %s\r\n", s_api_key);
     } else {
         client.printf("x-api-key: %s\r\n", s_api_key);
+        if (provider_is_minimax_compatible()) {
+            client.printf("Authorization: Bearer %s\r\n", s_api_key);
+        }
         client.printf("anthropic-version: %s\r\n", M5CLAW_LLM_API_VERSION);
     }
     client.printf("Content-Length: %d\r\n", bodyStr.length());
@@ -268,7 +309,7 @@ bool llm_chat_tools(const char* system_prompt,
     client.print(bodyStr);
     bodyStr = "";
 
-    unsigned long deadline = millis() + 120000;
+    unsigned long deadline = millis() + 45000;
 
     if (!skip_http_headers(client, deadline)) {
         Serial.println("[LLM] Timeout reading headers");
@@ -284,6 +325,7 @@ bool llm_chat_tools(const char* system_prompt,
 
     int respLen = read_http_body(client, respBuf, M5CLAW_LLM_RESPONSE_BUF, deadline);
     client.stop();
+    decode_chunked_in_place(respBuf, &respLen);
 
     Serial.printf("[LLM] Response %d bytes\n", respLen);
 
@@ -296,6 +338,10 @@ bool llm_chat_tools(const char* system_prompt,
         parse_openai_response(respBuf, respLen, resp);
     } else {
         parse_anthropic_response(respBuf, respLen, resp);
+    }
+
+    if (!resp->tool_use && (!resp->text || resp->text_len == 0)) {
+        Serial.printf("[LLM] Empty/unknown response: %.300s\n", respBuf);
     }
 
     heap_caps_free(respBuf);

@@ -66,6 +66,7 @@ static int16_t* voiceBuffer = nullptr;
 static size_t voiceBufferSamples = 0;
 static bool voiceRecording = false;
 static size_t recordedSamples = 0;
+static unsigned long recordingStartMs = 0;
 static bool ttsPlaying = false;
 static size_t ttsSamples = 0;
 
@@ -86,6 +87,14 @@ void processSerialCommands();
 static void onAgentResponse(const char* text);
 static volatile bool agentResponseReady = false;
 static char* agentResponseText = nullptr;
+
+static bool hasPreconfiguredOnlineSettings() {
+    bool hasLlm = Config::getLlmApiKey().length() > 0
+               && Config::getLlmProvider().length() > 0
+               && Config::getLlmModel().length() > 0;
+    bool hasSpeech = Config::getDashScopeKey().length() > 0;
+    return hasLlm || hasSpeech;
+}
 
 static void setIfEmpty(void (*setter)(const String&), const String& current, const char* buildVal) {
     if (current.length() == 0 && buildVal && buildVal[0])
@@ -368,7 +377,7 @@ void loop() {
             }
 
             if (!didBlock && voiceRecording) {
-                float duration = (float)recordedSamples / M5CLAW_STT_SAMPLE_RATE;
+                float duration = (float)(millis() - recordingStartMs) / 1000.0f;
                 if (duration >= M5CLAW_STT_MAX_SECONDS) {
                     chat.update(canvas);
                     canvas.fillRect(0, SCREEN_H - 16, SCREEN_W, 16, rgb565(200, 50, 50));
@@ -431,7 +440,6 @@ void loop() {
                     Serial.printf("[CHAT] Sending: %s\n", msg.c_str());
                     companion.triggerTalk();
 
-                    chat.appendAIToken("thinking...");
                     Agent::sendMessage(msg.c_str(), onAgentResponse);
 
                     M5Cardputer.update();
@@ -449,7 +457,7 @@ void loop() {
 
             chat.update(canvas);
             if (voiceRecording) {
-                float dur = (float)recordedSamples / M5CLAW_STT_SAMPLE_RATE;
+                float dur = (float)(millis() - recordingStartMs) / 1000.0f;
                 canvas.fillRect(0, SCREEN_H - 16, SCREEN_W, 16, rgb565(200, 50, 50));
                 canvas.setTextColor(Color::WHITE);
                 canvas.setTextSize(1);
@@ -504,25 +512,27 @@ void startVoiceRecording() {
     M5Cardputer.Mic.record(voiceBuffer, voiceBufferSamples, M5CLAW_STT_SAMPLE_RATE);
     voiceRecording = true;
     recordedSamples = 0;
+    recordingStartMs = millis();
     Serial.println("[VOICE] Recording started");
 }
 
 bool stopVoiceRecording() {
     if (!voiceRecording) return false;
     voiceRecording = false;
-
-    recordedSamples = M5Cardputer.Mic.isRecording()
-        ? (millis() % 1000) * M5CLAW_STT_SAMPLE_RATE / 1000  // approximate
-        : voiceBufferSamples;
+    unsigned long elapsedMs = millis() - recordingStartMs;
+    recordedSamples = ((size_t)elapsedMs * M5CLAW_STT_SAMPLE_RATE) / 1000;
+    if (recordedSamples > voiceBufferSamples) {
+        recordedSamples = voiceBufferSamples;
+    }
+    if (recordedSamples == 0) {
+        recordedSamples = min((size_t)M5CLAW_STT_SAMPLE_RATE / 2, voiceBufferSamples);
+    }
 
     M5Cardputer.Mic.end();
     M5Cardputer.Speaker.begin();
 
-    size_t elapsed = M5Cardputer.Mic.isRecording() ? 0 : voiceBufferSamples;
-    recordedSamples = voiceBufferSamples;
-
     int16_t maxVal = 0;
-    for (size_t i = 0; i < recordedSamples && i < 1000; i++) {
+    for (size_t i = 0; i < recordedSamples; i++) {
         int16_t v = abs(voiceBuffer[i]);
         if (v > maxVal) maxVal = v;
     }
@@ -532,7 +542,10 @@ bool stopVoiceRecording() {
         return false;
     }
 
-    Serial.printf("[VOICE] Stopped, %d samples, peak=%d\n", (int)recordedSamples, maxVal);
+    Serial.printf("[VOICE] Stopped, %d samples, %.2fs, peak=%d\n",
+                  (int)recordedSamples,
+                  (float)recordedSamples / M5CLAW_STT_SAMPLE_RATE,
+                  maxVal);
     return recordedSamples > M5CLAW_STT_SAMPLE_RATE / 3;
 }
 
@@ -607,6 +620,9 @@ void updateSetupMode() {
 
     canvas.setTextColor(Color::STATUS_DIM);
     canvas.drawString("[Enter] confirm  [Tab] skip/cancel", 10, 70);
+    if ((setupStep == SetupStep::SSID || setupStep == SetupStep::PASSWORD) && hasPreconfiguredOnlineSettings()) {
+        canvas.drawString("[default AI config loaded]", 10, 84);
+    }
 
     int stepNum = (int)setupStep + 1;
     int totalSteps = 7;
@@ -644,7 +660,16 @@ void handleSetupKey(char key, bool enter, bool backspace, bool tab) {
             setupInput = ""; setupStep = SetupStep::PASSWORD; break;
         case SetupStep::PASSWORD:
             if (setupInput.length() > 0) Config::setPassword(setupInput);
-            setupInput = ""; setupStep = SetupStep::LLM_KEY; break;
+            setupInput = "";
+            if (hasPreconfiguredOnlineSettings()) {
+                if (Config::getCity().length() == 0) Config::setCity("Beijing");
+                Config::save();
+                setupStep = SetupStep::CONNECTING;
+                connectWiFi();
+            } else {
+                setupStep = SetupStep::LLM_KEY;
+            }
+            break;
         case SetupStep::LLM_KEY:
             if (setupInput.length() > 0) Config::setLlmApiKey(setupInput);
             setupInput = ""; setupStep = SetupStep::LLM_PROVIDER; break;
