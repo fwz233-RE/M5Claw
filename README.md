@@ -300,8 +300,8 @@ M5Claw/
 
 ## 致谢
 
-- [ClawPuter](https://github.com/nicebug/ClawPuter) — 像素宠物 UI 和 M5Cardputer 硬件交互
-- [MimiClaw](https://github.com/pprp/mimiclaw) — AI Agent 核心架构
+- [ClawPuter](https://github.com/bryant24hao/ClawPuter) — 像素宠物 UI 和 M5Cardputer 硬件交互
+- [MimiClaw](https://github.com/memovai/mimiclaw/blob/main/README_CN.md) — AI Agent 核心架构
 - [DashScope](https://help.aliyun.com/zh/model-studio/) — 语音识别和语音合成 API，新用户赠送免费额度
 - [M5Stack](https://m5stack.com/) — Cardputer 硬件平台
 
