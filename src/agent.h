@@ -8,4 +8,5 @@ namespace Agent {
     void start();
     void sendMessage(const char* text, AgentResponseCallback onResponse);
     bool isBusy();
+    bool isReady();
 }

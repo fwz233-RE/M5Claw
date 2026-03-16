@@ -1,5 +1,6 @@
 #include "llm_client.h"
 #include "config.h"
+#include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <esp_heap_caps.h>
 
@@ -32,6 +33,45 @@ static bool provider_is_minimax_compatible() {
     return strstr(llm_host(), "minimax") != nullptr;
 }
 
+static bool resolve_host(const char* host, IPAddress& ip, const char* tag) {
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        if (WiFi.hostByName(host, ip)) {
+            Serial.printf("%s DNS %s -> %s\n", tag, host, ip.toString().c_str());
+            return true;
+        }
+        Serial.printf("%s DNS failed (%d/3)\n", tag, attempt);
+        delay(200);
+    }
+    return false;
+}
+
+static bool secure_connect(WiFiClientSecure& client, const char* host, uint16_t port, const char* tag) {
+    IPAddress ip;
+    if (!resolve_host(host, ip, tag)) return false;
+    client.setInsecure();
+    client.setTimeout(15000);
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        if (client.connect(ip, port)) {
+            return true;
+        }
+        Serial.printf("%s connect failed (%d/3)\n", tag, attempt);
+        delay(300);
+    }
+    return false;
+}
+
+static void* alloc_prefer_psram(size_t size) {
+    void* p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) p = heap_caps_malloc(size, MALLOC_CAP_8BIT);
+    return p;
+}
+
+static void* calloc_prefer_psram(size_t count, size_t size) {
+    void* p = heap_caps_calloc(count, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) p = heap_caps_calloc(count, size, MALLOC_CAP_8BIT);
+    return p;
+}
+
 void llm_client_init(const char* api_key, const char* model, const char* provider,
                      const char* custom_host, const char* custom_path) {
     if (api_key && api_key[0]) safe_copy(s_api_key, sizeof(s_api_key), api_key);
@@ -47,6 +87,8 @@ void llm_response_free(LlmResponse* resp) {
     free(resp->text);
     resp->text = nullptr;
     resp->text_len = 0;
+    free(resp->raw_content_json);
+    resp->raw_content_json = nullptr;
     for (int i = 0; i < resp->call_count; i++) {
         free(resp->calls[i].input);
         resp->calls[i].input = nullptr;
@@ -185,6 +227,12 @@ static void parse_anthropic_response(const char* json, size_t len, LlmResponse* 
     JsonArray content = doc["content"].as<JsonArray>();
     if (content.isNull()) return;
 
+    String rawContent;
+    serializeJson(content, rawContent);
+    if (rawContent.length() > 0) {
+        resp->raw_content_json = strdup(rawContent.c_str());
+    }
+
     size_t total_text = 0;
     for (JsonVariant block : content) {
         if (strcmp(block["type"] | "", "text") == 0) {
@@ -267,7 +315,8 @@ bool llm_chat_tools(const char* system_prompt,
         return false;
     }
 
-    JsonDocument* bodyDoc = new (heap_caps_malloc(sizeof(JsonDocument), MALLOC_CAP_SPIRAM)) JsonDocument;
+    void* bodyDocMem = alloc_prefer_psram(sizeof(JsonDocument));
+    JsonDocument* bodyDoc = bodyDocMem ? new (bodyDocMem) JsonDocument : nullptr;
     if (!bodyDoc) return false;
 
     if (provider_is_openai()) {
@@ -285,8 +334,7 @@ bool llm_chat_tools(const char* system_prompt,
     Serial.printf("[LLM] Request %d bytes to %s%s\n", bodyStr.length(), llm_host(), llm_path());
 
     WiFiClientSecure client;
-    client.setInsecure();
-    if (!client.connect(llm_host(), 443)) {
+    if (!secure_connect(client, llm_host(), 443, "[LLM]")) {
         Serial.println("[LLM] Connection failed");
         return false;
     }
@@ -294,13 +342,11 @@ bool llm_chat_tools(const char* system_prompt,
     client.printf("POST %s HTTP/1.1\r\n", llm_path());
     client.printf("Host: %s\r\n", llm_host());
     client.println("Content-Type: application/json");
+    client.println("Accept: application/json");
     if (provider_is_openai()) {
         client.printf("Authorization: Bearer %s\r\n", s_api_key);
     } else {
         client.printf("x-api-key: %s\r\n", s_api_key);
-        if (provider_is_minimax_compatible()) {
-            client.printf("Authorization: Bearer %s\r\n", s_api_key);
-        }
         client.printf("anthropic-version: %s\r\n", M5CLAW_LLM_API_VERSION);
     }
     client.printf("Content-Length: %d\r\n", bodyStr.length());
@@ -317,8 +363,12 @@ bool llm_chat_tools(const char* system_prompt,
         return false;
     }
 
-    char* respBuf = (char*)heap_caps_calloc(1, M5CLAW_LLM_RESPONSE_BUF, MALLOC_CAP_SPIRAM);
+    char* respBuf = (char*)calloc_prefer_psram(1, M5CLAW_LLM_RESPONSE_BUF);
     if (!respBuf) {
+        Serial.printf("[LLM] Failed to allocate %d-byte response buffer, free heap=%d largest=%d\n",
+                      (int)M5CLAW_LLM_RESPONSE_BUF,
+                      ESP.getFreeHeap(),
+                      heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
         client.stop();
         return false;
     }

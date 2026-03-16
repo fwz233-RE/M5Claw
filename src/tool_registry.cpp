@@ -5,6 +5,7 @@
 #include <WiFiClientSecure.h>
 #include <time.h>
 
+
 static bool tool_get_time(const char* input, char* output, size_t sz) {
     struct tm ti;
     if (getLocalTime(&ti, 0)) {
@@ -58,6 +59,7 @@ static bool tool_web_search(const char* input, char* output, size_t sz) {
     strlcpy(output, "Web search not yet implemented on this device.", sz);
     return true;
 }
+
 
 static const ToolDef s_tools[] = {
     {

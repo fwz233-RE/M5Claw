@@ -15,3 +15,4 @@ namespace ToolRegistry {
     const char* getToolsJson();
     bool execute(const char* name, const char* input, char* output, size_t output_size);
 }
+

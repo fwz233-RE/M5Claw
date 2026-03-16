@@ -17,21 +17,43 @@ struct AgentRequest {
 
 static QueueHandle_t s_queue = nullptr;
 static volatile bool s_busy = false;
+static volatile bool s_ready = false;
 static const char* CHAT_ID = "local";
 
 #define TOOL_OUTPUT_SIZE (4 * 1024)
 
+static void* alloc_prefer_psram(size_t size) {
+    void* p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) p = heap_caps_malloc(size, MALLOC_CAP_8BIT);
+    return p;
+}
+
+static void* calloc_prefer_psram(size_t count, size_t size) {
+    void* p = heap_caps_calloc(count, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) p = heap_caps_calloc(count, size, MALLOC_CAP_8BIT);
+    return p;
+}
+
 static void agent_task(void* arg) {
     Serial.printf("[AGENT] Task started on core %d\n", xPortGetCoreID());
 
-    char* system_prompt = (char*)heap_caps_calloc(1, M5CLAW_CONTEXT_BUF_SIZE, MALLOC_CAP_SPIRAM);
-    char* tool_output = (char*)heap_caps_calloc(1, TOOL_OUTPUT_SIZE, MALLOC_CAP_SPIRAM);
+    char* system_prompt = (char*)calloc_prefer_psram(1, M5CLAW_CONTEXT_BUF_SIZE);
+    char* tool_output = (char*)calloc_prefer_psram(1, TOOL_OUTPUT_SIZE);
 
     if (!system_prompt || !tool_output) {
-        Serial.println("[AGENT] Failed to allocate PSRAM");
+        Serial.println("[AGENT] Failed to allocate working buffers");
+        free(system_prompt);
+        free(tool_output);
+        s_ready = false;
         vTaskDelete(nullptr);
         return;
     }
+
+    s_ready = true;
+    Serial.printf("[AGENT] Ready. Free heap=%d psram=%d stackHW=%u\n",
+                  ESP.getFreeHeap(),
+                  (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                  (unsigned)uxTaskGetStackHighWaterMark(nullptr));
 
     while (true) {
         AgentRequest req;
@@ -44,8 +66,14 @@ static void agent_task(void* arg) {
 
         String histJson = SessionMgr::getHistoryJson(CHAT_ID, M5CLAW_AGENT_MAX_HISTORY);
 
-        JsonDocument* messages = new (heap_caps_malloc(sizeof(JsonDocument), MALLOC_CAP_SPIRAM)) JsonDocument;
-        if (!messages) { s_busy = false; free(req.text); continue; }
+        void* messagesMem = alloc_prefer_psram(sizeof(JsonDocument));
+        JsonDocument* messages = messagesMem ? new (messagesMem) JsonDocument : nullptr;
+        if (!messages) {
+            s_busy = false;
+            free(req.text);
+            if (req.callback) req.callback("Agent out of memory.");
+            continue;
+        }
 
         deserializeJson(*messages, histJson);
 
@@ -80,19 +108,35 @@ static void agent_task(void* arg) {
             asstMsg["role"] = "assistant";
             JsonArray asstContent = asstMsg["content"].to<JsonArray>();
 
-            if (resp.text && resp.text_len > 0) {
-                JsonObject tb = asstContent.add<JsonObject>();
-                tb["type"] = "text";
-                tb["text"] = resp.text;
+            bool copiedRawContent = false;
+            if (resp.raw_content_json && resp.raw_content_json[0]) {
+                JsonDocument rawContentDoc;
+                if (deserializeJson(rawContentDoc, resp.raw_content_json) == DeserializationError::Ok) {
+                    JsonArray rawContent = rawContentDoc.as<JsonArray>();
+                    if (!rawContent.isNull()) {
+                        for (JsonVariant block : rawContent) {
+                            asstContent.add(block);
+                        }
+                        copiedRawContent = true;
+                    }
+                }
             }
-            for (int i = 0; i < resp.call_count; i++) {
-                JsonObject tu = asstContent.add<JsonObject>();
-                tu["type"] = "tool_use";
-                tu["id"] = resp.calls[i].id;
-                tu["name"] = resp.calls[i].name;
-                JsonDocument inputDoc;
-                deserializeJson(inputDoc, resp.calls[i].input ? resp.calls[i].input : "{}");
-                tu["input"] = inputDoc;
+
+            if (!copiedRawContent) {
+                if (resp.text && resp.text_len > 0) {
+                    JsonObject tb = asstContent.add<JsonObject>();
+                    tb["type"] = "text";
+                    tb["text"] = resp.text;
+                }
+                for (int i = 0; i < resp.call_count; i++) {
+                    JsonObject tu = asstContent.add<JsonObject>();
+                    tu["type"] = "tool_use";
+                    tu["id"] = resp.calls[i].id;
+                    tu["name"] = resp.calls[i].name;
+                    JsonDocument inputDoc;
+                    deserializeJson(inputDoc, resp.calls[i].input ? resp.calls[i].input : "{}");
+                    tu["input"] = inputDoc;
+                }
             }
 
             JsonObject resultMsg = messages->as<JsonArray>().add<JsonObject>();
@@ -129,8 +173,10 @@ static void agent_task(void* arg) {
 
         free(req.text);
         s_busy = false;
-        Serial.printf("[AGENT] Done. Free PSRAM: %d\n",
-                      (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        Serial.printf("[AGENT] Done. Free heap=%d psram=%d stackHW=%u\n",
+                      ESP.getFreeHeap(),
+                      (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                      (unsigned)uxTaskGetStackHighWaterMark(nullptr));
     }
 }
 
@@ -145,6 +191,10 @@ void Agent::start() {
 }
 
 void Agent::sendMessage(const char* text, AgentResponseCallback onResponse) {
+    if (!s_ready) {
+        if (onResponse) onResponse("Agent unavailable: memory init failed.");
+        return;
+    }
     AgentRequest req;
     req.text = strdup(text);
     req.callback = onResponse;
@@ -155,3 +205,4 @@ void Agent::sendMessage(const char* text, AgentResponseCallback onResponse) {
 }
 
 bool Agent::isBusy() { return s_busy; }
+bool Agent::isReady() { return s_ready; }

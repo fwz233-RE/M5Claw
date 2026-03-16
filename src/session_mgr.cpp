@@ -72,3 +72,24 @@ String SessionMgr::getHistoryJson(const char* chat_id, int maxMessages) {
 void SessionMgr::clearSession(const char* chat_id) {
     SPIFFS.remove(sessionPath(chat_id));
 }
+
+void SessionMgr::trimSession(const char* chat_id) {
+    String history = getHistoryJson(chat_id, M5CLAW_SESSION_MAX_MSGS);
+    String path = sessionPath(chat_id);
+    SPIFFS.remove(path);
+
+    File f = SPIFFS.open(path, "w");
+    if (!f) return;
+
+    JsonDocument doc;
+    if (deserializeJson(doc, history) == DeserializationError::Ok) {
+        JsonArray arr = doc.as<JsonArray>();
+        for (JsonVariant msg : arr) {
+            String line;
+            serializeJson(msg, line);
+            f.println(line);
+        }
+    }
+    f.close();
+    Serial.printf("[SESSION] Trimmed to last %d messages\n", M5CLAW_SESSION_MAX_MSGS);
+}

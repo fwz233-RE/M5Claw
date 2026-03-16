@@ -17,6 +17,7 @@
 #include "dashscope_stt.h"
 #include "dashscope_tts.h"
 #include <esp_heap_caps.h>
+#include "soc/rtc_cntl_reg.h"
 
 #ifndef USER_WIFI_SSID
 #define USER_WIFI_SSID ""
@@ -70,6 +71,9 @@ static unsigned long recordingStartMs = 0;
 static bool ttsPlaying = false;
 static size_t ttsSamples = 0;
 
+static const size_t STT_CHUNK_SAMPLES = 1600; // 100ms at 16kHz = 3.2KB
+static int16_t* sttChunkBuf = nullptr;
+
 void enterSetupMode();
 void updateSetupMode();
 void handleSetupKey(char key, bool enter, bool backspace, bool tab);
@@ -79,8 +83,10 @@ void initOnlineServices();
 void enterCompanionMode();
 void enterChatMode();
 void initVoiceBuffer();
+void releaseVoiceBuffer();
 void startVoiceRecording();
-bool stopVoiceRecording();
+String stopVoiceRecording();
+void streamVoiceData();
 void fillBuildTimeDefaults();
 void processSerialCommands();
 
@@ -186,12 +192,23 @@ void processSerialCommands() {
 }
 
 void setup() {
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
     auto cfg = M5.config();
+    cfg.output_power = true;
     M5Cardputer.begin(cfg, true);
 
     Serial.begin(115200);
-    delay(1000);
+    delay(500);
     Serial.println("[BOOT] M5Claw starting...");
+
+    int32_t battLevel = M5Cardputer.Power.getBatteryLevel();
+    int16_t battVolt = M5Cardputer.Power.getBatteryVoltage();
+    Serial.printf("[POWER] Board=%d BattLevel=%d%% BattVolt=%dmV\n",
+                  (int)M5.getBoard(), battLevel, battVolt);
+    if (battVolt < 3000) {
+        Serial.println("[POWER] WARNING: Low/no battery. Turn ON the battery switch on the side of M5Cardputer.");
+    }
 
     M5Cardputer.Display.setRotation(1);
     M5Cardputer.Display.setBrightness(80);
@@ -239,7 +256,7 @@ void loop() {
         chat.appendAIToken(filtered);
         chat.onAIResponseComplete();
 
-        if (!chat.hasNewPixelArt() && strlen(agentResponseText) > 0
+        if (strlen(agentResponseText) > 0
             && Config::getDashScopeKey().length() > 0) {
             const char* shortText = agentResponseText;
             size_t textLen = strlen(shortText);
@@ -248,19 +265,26 @@ void loop() {
             memcpy(ttsText, shortText, textLen);
             ttsText[textLen] = '\0';
 
-            M5Cardputer.Speaker.end();
-            delay(50);
-            M5Cardputer.Mic.end();
-            auto spkCfg = M5Cardputer.Speaker.config();
-            M5Cardputer.Speaker.config(spkCfg);
-            M5Cardputer.Speaker.begin();
+            if (!voiceBuffer) initVoiceBuffer();
+            size_t heapAfterBuf = ESP.getFreeHeap();
+            if (voiceBuffer && heapAfterBuf > 80000) {
+                M5Cardputer.Speaker.end();
+                delay(50);
+                M5Cardputer.Mic.end();
+                auto spkCfg = M5Cardputer.Speaker.config();
+                M5Cardputer.Speaker.config(spkCfg);
+                M5Cardputer.Speaker.begin();
 
-            if (voiceBuffer) {
                 ttsSamples = DashScopeTTS::synthesize(ttsText, voiceBuffer, voiceBufferSamples);
                 if (ttsSamples > 0) {
                     ttsPlaying = true;
                     M5Cardputer.Speaker.playRaw(voiceBuffer, ttsSamples, M5CLAW_TTS_SAMPLE_RATE, false);
+                } else {
+                    releaseVoiceBuffer();
                 }
+            } else {
+                Serial.printf("[TTS] Skipped: heap=%d after buf alloc (need >80000)\n", (int)heapAfterBuf);
+                releaseVoiceBuffer();
             }
         }
 
@@ -272,6 +296,7 @@ void loop() {
 
     if (ttsPlaying && !M5Cardputer.Speaker.isPlaying()) {
         ttsPlaying = false;
+        releaseVoiceBuffer();
     }
 
     switch (appMode) {
@@ -348,6 +373,7 @@ void loop() {
         case AppMode::CHAT: {
             auto ks = M5Cardputer.Keyboard.keysState();
             static bool pFn = false, pEnter = false, pDel = false, pTab = false;
+            static bool pAlt = false, pCtrl = false;
             static char pWordChar = 0;
             bool didBlock = false;
 
@@ -359,37 +385,24 @@ void loop() {
             if (!offlineMode && fnDown && fnAlone && !voiceRecording
                 && !Agent::isBusy() && !ttsPlaying
                 && Config::getDashScopeKey().length() > 0) {
+                chat.update(canvas);
+                canvas.fillRect(0, SCREEN_H - 16, SCREEN_W, 16, rgb565(50, 50, 200));
+                canvas.setTextColor(Color::WHITE);
+                canvas.setTextSize(1);
+                canvas.drawString("Connecting...", 80, SCREEN_H - 12);
+                canvas.pushSprite(0, 0);
                 startVoiceRecording();
             }
             if (fnUp && voiceRecording) {
-                chat.update(canvas);
-                canvas.fillRect(0, SCREEN_H - 16, SCREEN_W, 16, rgb565(200, 50, 50));
-                canvas.setTextColor(Color::WHITE);
-                canvas.setTextSize(1);
-                canvas.drawString("Transcribing...", 80, SCREEN_H - 12);
-                canvas.pushSprite(0, 0);
-
-                if (stopVoiceRecording()) {
-                    String text = DashScopeSTT::recognize(voiceBuffer, recordedSamples);
-                    if (text.length() > 0) chat.setInput(text);
-                }
+                String text = stopVoiceRecording();
+                if (text.length() > 0) chat.setInput(text);
                 didBlock = true;
             }
 
             if (!didBlock && voiceRecording) {
-                float duration = (float)(millis() - recordingStartMs) / 1000.0f;
-                if (duration >= M5CLAW_STT_MAX_SECONDS) {
-                    chat.update(canvas);
-                    canvas.fillRect(0, SCREEN_H - 16, SCREEN_W, 16, rgb565(200, 50, 50));
-                    canvas.setTextColor(Color::WHITE);
-                    canvas.setTextSize(1);
-                    canvas.drawString("Transcribing...", 80, SCREEN_H - 12);
-                    canvas.pushSprite(0, 0);
-
-                    if (stopVoiceRecording()) {
-                        String text = DashScopeSTT::recognize(voiceBuffer, recordedSamples);
-                        if (text.length() > 0) chat.setInput(text);
-                    }
+                streamVoiceData();
+                if (!DashScopeSTT::isStreaming()) {
+                    stopVoiceRecording();
                     didBlock = true;
                 }
             }
@@ -402,31 +415,36 @@ void loop() {
             bool enterDown = !didBlock && ks.enter && !pEnter;
             bool delDown   = !didBlock && ks.del && !pDel;
             bool tabDown   = !didBlock && ks.tab && !pTab;
+            bool altDown   = !didBlock && ks.alt && !pAlt;
+            bool ctrlDown  = !didBlock && ks.ctrl && !pCtrl;
             char curWordChar = (ks.word.size() > 0) ? ks.word[0] : 0;
             bool charDown  = !didBlock && curWordChar != 0 && curWordChar != pWordChar;
 
             pFn = ks.fn; pEnter = ks.enter; pDel = ks.del; pTab = ks.tab;
+            pAlt = ks.alt; pCtrl = ks.ctrl;
             pWordChar = curWordChar;
 
             if (!voiceRecording) {
-                if (tabDown) {
+                if (altDown) {
                     playTransition(canvas, false);
                     enterCompanionMode();
                     break;
                 }
-                if (enterDown) {
+                if (tabDown) {
+                    chat.scrollUp();
+                } else if (ctrlDown) {
+                    if (chat.isAtBottom()) {
+                        playTransition(canvas, false);
+                        enterCompanionMode();
+                        break;
+                    }
+                    chat.scrollDown();
+                } else if (enterDown) {
                     chat.handleEnter();
                 } else if (delDown) {
                     chat.handleBackspace();
-                } else if (charDown) {
-                    char key = ks.word[0];
-                    if (ks.fn && key == ';') {
-                        chat.scrollUp();
-                    } else if (ks.fn && key == '/') {
-                        chat.scrollDown();
-                    } else if (!ks.fn) {
-                        chat.handleKey(key);
-                    }
+                } else if (charDown && !ks.fn) {
+                    chat.handleKey(ks.word[0]);
                 }
             }
 
@@ -439,20 +457,23 @@ void loop() {
                     String msg = chat.takePendingMessage();
                     Serial.printf("[CHAT] Sending: %s\n", msg.c_str());
                     companion.triggerTalk();
+                    releaseVoiceBuffer();
 
                     Agent::sendMessage(msg.c_str(), onAgentResponse);
 
                     M5Cardputer.update();
                     ks = M5Cardputer.Keyboard.keysState();
                     pFn = ks.fn; pEnter = ks.enter; pDel = ks.del; pTab = ks.tab;
+                    pAlt = ks.alt; pCtrl = ks.ctrl;
                     pWordChar = (ks.word.size() > 0) ? ks.word[0] : 0;
-                    enterDown = delDown = tabDown = charDown = false;
+                    enterDown = delDown = tabDown = altDown = ctrlDown = charDown = false;
                 }
             }
 
-            if (ttsPlaying && (enterDown || delDown || tabDown || charDown || fnDown)) {
+            if (ttsPlaying && (enterDown || delDown || tabDown || altDown || charDown || fnDown)) {
                 M5Cardputer.Speaker.stop();
                 ttsPlaying = false;
+                releaseVoiceBuffer();
             }
 
             chat.update(canvas);
@@ -461,9 +482,16 @@ void loop() {
                 canvas.fillRect(0, SCREEN_H - 16, SCREEN_W, 16, rgb565(200, 50, 50));
                 canvas.setTextColor(Color::WHITE);
                 canvas.setTextSize(1);
-                char recLabel[32];
-                snprintf(recLabel, sizeof(recLabel), "Recording... %.1fs", dur);
-                canvas.drawString(recLabel, 70, SCREEN_H - 12);
+                String partial = DashScopeSTT::getPartialText();
+                if (partial.length() > 0) {
+                    char recLabel[128];
+                    snprintf(recLabel, sizeof(recLabel), "%.0fs %s", dur, partial.c_str());
+                    canvas.drawString(recLabel, 4, SCREEN_H - 12);
+                } else {
+                    char recLabel[32];
+                    snprintf(recLabel, sizeof(recLabel), "Recording... %.1fs", dur);
+                    canvas.drawString(recLabel, 70, SCREEN_H - 12);
+                }
             } else if (ttsPlaying) {
                 canvas.fillRect(0, SCREEN_H - 16, SCREEN_W, 16, rgb565(50, 120, 200));
                 canvas.setTextColor(Color::WHITE);
@@ -486,19 +514,62 @@ static void onAgentResponse(const char* text) {
 
 void initVoiceBuffer() {
     if (voiceBuffer) return;
-    voiceBufferSamples = M5CLAW_VOICE_BUF_SAMPLES;
-    size_t bytes = voiceBufferSamples * sizeof(int16_t);
-    voiceBuffer = (int16_t*)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!voiceBuffer) {
-        voiceBuffer = (int16_t*)heap_caps_malloc(bytes, MALLOC_CAP_8BIT);
+
+    const size_t TLS_RESERVE = 50 * 1024;
+    const size_t MAX_SAMPLES = 80000;
+    const size_t MIN_SAMPLES = 8000;
+
+    size_t freeHeap = ESP.getFreeHeap();
+    if (freeHeap <= TLS_RESERVE) {
+        Serial.printf("[VOICE] Buffer: FAIL, heap=%d too low (need %d reserved)\n",
+                      (int)freeHeap, (int)TLS_RESERVE);
+        return;
     }
-    Serial.printf("[VOICE] Buffer: %s, %d samples\n",
-                  voiceBuffer ? "OK" : "FAIL", (int)voiceBufferSamples);
+
+    size_t maxBytes = freeHeap - TLS_RESERVE;
+    size_t maxSamples = maxBytes / sizeof(int16_t);
+    if (maxSamples > MAX_SAMPLES) maxSamples = MAX_SAMPLES;
+    maxSamples = (maxSamples / 1000) * 1000;
+
+    if (maxSamples < MIN_SAMPLES) {
+        Serial.printf("[VOICE] Buffer: FAIL, only %d samples possible\n", (int)maxSamples);
+        return;
+    }
+
+    size_t bytes = maxSamples * sizeof(int16_t);
+    voiceBuffer = (int16_t*)heap_caps_malloc(bytes, MALLOC_CAP_8BIT);
+    if (voiceBuffer) {
+        voiceBufferSamples = maxSamples;
+        Serial.printf("[VOICE] Buffer: OK, %d samples (%.2fs @24k / %.2fs @16k) heap=%d\n",
+                      (int)voiceBufferSamples,
+                      (float)voiceBufferSamples / M5CLAW_TTS_SAMPLE_RATE,
+                      (float)voiceBufferSamples / M5CLAW_STT_SAMPLE_RATE,
+                      ESP.getFreeHeap());
+    } else {
+        voiceBufferSamples = 0;
+        Serial.printf("[VOICE] Buffer: FAIL, malloc(%d) failed, heap=%d\n",
+                      (int)bytes, (int)freeHeap);
+    }
+}
+
+void releaseVoiceBuffer() {
+    if (!voiceBuffer) return;
+    free(voiceBuffer);
+    voiceBuffer = nullptr;
+    voiceBufferSamples = 0;
+    recordedSamples = 0;
 }
 
 void startVoiceRecording() {
-    if (!voiceBuffer) return;
     M5Cardputer.Speaker.end();
+
+    if (!sttChunkBuf) {
+        sttChunkBuf = (int16_t*)malloc(STT_CHUNK_SAMPLES * sizeof(int16_t));
+    }
+    if (!sttChunkBuf) {
+        Serial.println("[VOICE] Failed to alloc chunk buffer");
+        return;
+    }
 
     auto micCfg = M5Cardputer.Mic.config();
     micCfg.sample_rate = M5CLAW_STT_SAMPLE_RATE;
@@ -508,45 +579,55 @@ void startVoiceRecording() {
     M5Cardputer.Mic.config(micCfg);
     M5Cardputer.Mic.begin();
 
-    memset(voiceBuffer, 0, voiceBufferSamples * sizeof(int16_t));
-    M5Cardputer.Mic.record(voiceBuffer, voiceBufferSamples, M5CLAW_STT_SAMPLE_RATE);
+    if (!DashScopeSTT::beginStream()) {
+        Serial.println("[VOICE] STT stream failed");
+        M5Cardputer.Mic.end();
+        M5Cardputer.Speaker.begin();
+        free(sttChunkBuf); sttChunkBuf = nullptr;
+        return;
+    }
+
+    memset(sttChunkBuf, 0, STT_CHUNK_SAMPLES * sizeof(int16_t));
+    M5Cardputer.Mic.record(sttChunkBuf, STT_CHUNK_SAMPLES, M5CLAW_STT_SAMPLE_RATE);
     voiceRecording = true;
     recordedSamples = 0;
     recordingStartMs = millis();
-    Serial.println("[VOICE] Recording started");
+    Serial.printf("[VOICE] Streaming started, heap=%d\n", ESP.getFreeHeap());
 }
 
-bool stopVoiceRecording() {
-    if (!voiceRecording) return false;
+void streamVoiceData() {
+    if (!voiceRecording || !sttChunkBuf) return;
+
+    if (!M5Cardputer.Mic.isRecording()) {
+        DashScopeSTT::feedAudio(sttChunkBuf, STT_CHUNK_SAMPLES);
+        recordedSamples += STT_CHUNK_SAMPLES;
+        memset(sttChunkBuf, 0, STT_CHUNK_SAMPLES * sizeof(int16_t));
+        M5Cardputer.Mic.record(sttChunkBuf, STT_CHUNK_SAMPLES, M5CLAW_STT_SAMPLE_RATE);
+    }
+
+    DashScopeSTT::poll();
+}
+
+String stopVoiceRecording() {
+    if (!voiceRecording) return "";
     voiceRecording = false;
-    unsigned long elapsedMs = millis() - recordingStartMs;
-    recordedSamples = ((size_t)elapsedMs * M5CLAW_STT_SAMPLE_RATE) / 1000;
-    if (recordedSamples > voiceBufferSamples) {
-        recordedSamples = voiceBufferSamples;
-    }
-    if (recordedSamples == 0) {
-        recordedSamples = min((size_t)M5CLAW_STT_SAMPLE_RATE / 2, voiceBufferSamples);
-    }
 
     M5Cardputer.Mic.end();
+
+    if (sttChunkBuf) {
+        DashScopeSTT::feedAudio(sttChunkBuf, STT_CHUNK_SAMPLES);
+    }
+
+    String result = DashScopeSTT::endStream();
+
+    free(sttChunkBuf);
+    sttChunkBuf = nullptr;
+
     M5Cardputer.Speaker.begin();
 
-    int16_t maxVal = 0;
-    for (size_t i = 0; i < recordedSamples; i++) {
-        int16_t v = abs(voiceBuffer[i]);
-        if (v > maxVal) maxVal = v;
-    }
-
-    if (maxVal < 100) {
-        Serial.println("[VOICE] Too quiet, skipping");
-        return false;
-    }
-
-    Serial.printf("[VOICE] Stopped, %d samples, %.2fs, peak=%d\n",
-                  (int)recordedSamples,
-                  (float)recordedSamples / M5CLAW_STT_SAMPLE_RATE,
-                  maxVal);
-    return recordedSamples > M5CLAW_STT_SAMPLE_RATE / 3;
+    float duration = (float)(millis() - recordingStartMs) / 1000.0f;
+    Serial.printf("[VOICE] Stopped streaming, %.2fs, result: %s\n", duration, result.c_str());
+    return result;
 }
 
 void enterSetupMode() {
@@ -793,7 +874,6 @@ void initOnlineServices() {
     }
 
     weatherClient.begin(Config::getCity());
-    initVoiceBuffer();
     Agent::start();
 
     delay(500);

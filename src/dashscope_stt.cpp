@@ -6,10 +6,13 @@
 
 static char s_api_key[320] = {0};
 static String s_result;
+static String s_partial;
 static volatile bool s_ws_connected = false;
 static volatile bool s_task_started = false;
 static volatile bool s_ws_done = false;
+static bool s_streaming = false;
 static WebSocketsClient* s_ws = nullptr;
+static char s_task_id[48] = {0};
 
 static void ws_event(WStype_t type, uint8_t* payload, size_t length) {
     switch (type) {
@@ -25,23 +28,25 @@ static void ws_event(WStype_t type, uint8_t* payload, size_t length) {
         case WStype_TEXT: {
             JsonDocument doc;
             if (deserializeJson(doc, payload, length) == DeserializationError::Ok) {
-                const char* action = doc["header"]["action"] | "";
-                if (strcmp(action, "result-generated") == 0) {
+                const char* event = doc["header"]["event"] | doc["header"]["action"] | "";
+                if (strcmp(event, "result-generated") == 0) {
                     JsonObject output = doc["payload"]["output"];
                     JsonObject sentence = output["sentence"];
                     const char* text = sentence["text"] | "";
                     if (text[0]) {
                         s_result = text;
+                        s_partial = text;
                         Serial.printf("[STT] Text: %s\n", text);
                     }
-                } else if (strcmp(action, "task-started") == 0) {
+                } else if (strcmp(event, "task-started") == 0) {
                     Serial.println("[STT] Task started");
                     s_task_started = true;
-                } else if (strcmp(action, "task-finished") == 0) {
+                } else if (strcmp(event, "task-finished") == 0) {
                     Serial.println("[STT] Task finished");
                     s_ws_done = true;
-                } else if (strcmp(action, "task-failed") == 0) {
-                    Serial.printf("[STT] Task failed: %s\n", (const char*)(doc["header"]["message"] | "unknown"));
+                } else if (strcmp(event, "task-failed") == 0) {
+                    const char* errMsg = doc["header"]["error_message"] | doc["header"]["message"] | "unknown";
+                    Serial.printf("[STT] Task failed: %s\n", errMsg);
                     s_ws_done = true;
                 }
             }
@@ -57,25 +62,31 @@ void DashScopeSTT::init(const char* apiKey) {
     Serial.println("[STT] Initialized");
 }
 
-String DashScopeSTT::recognize(const int16_t* samples, size_t sampleCount) {
-    if (!s_api_key[0] || sampleCount == 0) return "";
+bool DashScopeSTT::beginStream() {
+    if (!s_api_key[0]) return false;
+    if (s_streaming) endStream();
 
     s_result = "";
+    s_partial = "";
     s_ws_connected = false;
     s_task_started = false;
     s_ws_done = false;
 
     if (s_ws) { delete s_ws; s_ws = nullptr; }
     s_ws = new WebSocketsClient();
+    if (!s_ws) {
+        Serial.println("[STT] Failed to allocate WebSocket");
+        return false;
+    }
+
+    Serial.printf("[STT] Connecting, heap=%d\n", ESP.getFreeHeap());
 
     char authHeader[384];
     snprintf(authHeader, sizeof(authHeader), "Authorization: Bearer %s", s_api_key);
-
     s_ws->setExtraHeaders(authHeader);
     s_ws->onEvent(ws_event);
     s_ws->beginSSL(M5CLAW_STT_WS_HOST, M5CLAW_STT_WS_PORT, M5CLAW_STT_WS_PATH, "", "");
 
-    // Wait for connection
     unsigned long start = millis();
     while (!s_ws_connected && millis() - start < 10000) {
         s_ws->loop();
@@ -84,15 +95,13 @@ String DashScopeSTT::recognize(const int16_t* samples, size_t sampleCount) {
     if (!s_ws_connected) {
         Serial.println("[STT] Connection timeout");
         delete s_ws; s_ws = nullptr;
-        return "";
+        return false;
     }
 
-    // Send run-task
-    char taskId[48];
-    snprintf(taskId, sizeof(taskId), "stt-%lu", millis());
+    snprintf(s_task_id, sizeof(s_task_id), "stt-%lu", millis());
     JsonDocument startDoc;
     startDoc["header"]["action"] = "run-task";
-    startDoc["header"]["task_id"] = taskId;
+    startDoc["header"]["task_id"] = s_task_id;
     startDoc["header"]["streaming"] = "duplex";
     startDoc["payload"]["model"] = M5CLAW_STT_MODEL;
     startDoc["payload"]["task_group"] = "audio";
@@ -100,12 +109,12 @@ String DashScopeSTT::recognize(const int16_t* samples, size_t sampleCount) {
     startDoc["payload"]["function"] = "recognition";
     startDoc["payload"]["parameters"]["format"] = "pcm";
     startDoc["payload"]["parameters"]["sample_rate"] = M5CLAW_STT_SAMPLE_RATE;
+    startDoc["payload"]["input"].to<JsonObject>();
     String startJson;
     serializeJson(startDoc, startJson);
     s_ws->sendTXT(startJson);
-    Serial.printf("[STT] Sent run-task, %d samples to send\n", (int)sampleCount);
+    Serial.println("[STT] Sent run-task (streaming)");
 
-    // Wait for task-started
     start = millis();
     while (!s_task_started && !s_ws_done && millis() - start < 5000) {
         s_ws->loop();
@@ -114,39 +123,48 @@ String DashScopeSTT::recognize(const int16_t* samples, size_t sampleCount) {
     if (!s_task_started) {
         Serial.println("[STT] Task start timeout");
         delete s_ws; s_ws = nullptr;
-        return "";
+        return false;
     }
 
-    // Send audio in chunks
-    const size_t chunkSamples = M5CLAW_STT_SAMPLE_RATE * M5CLAW_STT_CHUNK_MS / 1000;
-    const size_t chunkBytes = chunkSamples * sizeof(int16_t);
-    const uint8_t* audioBytes = (const uint8_t*)samples;
-    size_t totalBytes = sampleCount * sizeof(int16_t);
-    size_t sent = 0;
+    s_streaming = true;
+    return true;
+}
 
-    while (sent < totalBytes && !s_ws_done) {
-        size_t toSend = totalBytes - sent;
-        if (toSend > chunkBytes) toSend = chunkBytes;
-        s_ws->sendBIN(audioBytes + sent, toSend);
-        sent += toSend;
-        s_ws->loop();
-        delay(5);
-    }
+void DashScopeSTT::feedAudio(const int16_t* samples, size_t count) {
+    if (!s_streaming || !s_ws || !s_ws_connected || s_ws_done) return;
+    s_ws->sendBIN((const uint8_t*)samples, count * sizeof(int16_t));
+}
 
-    // Send finish-task
-    JsonDocument finishDoc;
-    finishDoc["header"]["action"] = "finish-task";
-    finishDoc["header"]["task_id"] = taskId;
-    finishDoc["payload"]["input"] = JsonObject();
-    String finishJson;
-    serializeJson(finishDoc, finishJson);
-    s_ws->sendTXT(finishJson);
+void DashScopeSTT::poll() {
+    if (s_ws) s_ws->loop();
+}
 
-    // Wait for final result
-    start = millis();
-    while (!s_ws_done && millis() - start < 10000) {
-        s_ws->loop();
-        delay(10);
+bool DashScopeSTT::isStreaming() {
+    return s_streaming && s_ws && s_ws_connected && !s_ws_done;
+}
+
+String DashScopeSTT::getPartialText() {
+    return s_partial;
+}
+
+String DashScopeSTT::endStream() {
+    if (!s_streaming) return s_result;
+    s_streaming = false;
+
+    if (s_ws && s_ws_connected && !s_ws_done) {
+        JsonDocument finishDoc;
+        finishDoc["header"]["action"] = "finish-task";
+        finishDoc["header"]["task_id"] = s_task_id;
+        finishDoc["payload"]["input"].to<JsonObject>();
+        String finishJson;
+        serializeJson(finishDoc, finishJson);
+        s_ws->sendTXT(finishJson);
+
+        unsigned long start = millis();
+        while (!s_ws_done && millis() - start < 10000) {
+            s_ws->loop();
+            delay(10);
+        }
     }
 
     delete s_ws;
@@ -154,4 +172,22 @@ String DashScopeSTT::recognize(const int16_t* samples, size_t sampleCount) {
 
     Serial.printf("[STT] Final result: %s\n", s_result.c_str());
     return s_result;
+}
+
+String DashScopeSTT::recognize(const int16_t* samples, size_t sampleCount) {
+    if (!sampleCount) return "";
+    if (!beginStream()) return "";
+
+    const size_t chunkSamples = M5CLAW_STT_SAMPLE_RATE * M5CLAW_STT_CHUNK_MS / 1000;
+    size_t sent = 0;
+    while (sent < sampleCount && !s_ws_done) {
+        size_t toSend = sampleCount - sent;
+        if (toSend > chunkSamples) toSend = chunkSamples;
+        feedAudio(samples + sent, toSend);
+        sent += toSend;
+        poll();
+        delay(5);
+    }
+
+    return endStream();
 }

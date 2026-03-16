@@ -16,8 +16,6 @@ void ContextBuilder::buildSystemPrompt(char* buf, size_t bufSize) {
         "- Keep responses concise (under 200 characters when possible).\n"
         "- You have tools: get_current_time, read_file, write_file, web_search.\n"
         "- Use write_file to update memory/MEMORY.md to remember important info.\n"
-        "- For pixel art requests, wrap output in [PIXELART:N]...[/PIXELART] tags.\n"
-        "  Use hex chars 0-f for 16-color palette.\n"
         "- Respond in the user's language (Chinese or English).\n",
         soul.c_str(), user.c_str(), memory.c_str());
 }

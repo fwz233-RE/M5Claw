@@ -631,42 +631,71 @@ void Companion::drawClock(M5Canvas& canvas) {
     canvas.setTextColor(Color::CLOCK_TEXT);
     canvas.setTextSize(2);
 
-    // Layout: center "HH:MM  0°" as a whole if weather valid
+    // Battery percentage — smoothed, update every 10s
+    static int32_t cachedBatt = -1;
+    static unsigned long lastBattRead = 0;
+    unsigned long now = millis();
+    if (cachedBatt < 0 || now - lastBattRead > 10000) {
+        int32_t raw = M5Cardputer.Power.getBatteryLevel();
+        if (raw >= 0 && raw <= 100) {
+            cachedBatt = (cachedBatt < 0) ? raw : (cachedBatt * 3 + raw) / 4;
+        }
+        lastBattRead = now;
+    }
+    char battStr[8] = {};
+    int battW = 0;
+    bool hasBatt = (cachedBatt >= 0 && cachedBatt <= 100);
+    if (hasBatt) {
+        snprintf(battStr, sizeof(battStr), "%d%%", (int)cachedBatt);
+        battW = canvas.textWidth(battStr);
+    }
+
+    // Temperature string
     char tempStr[8] = {};
     int tempW = 0;
     if (weather.valid) {
         int tempInt = (int)roundf(weather.temperature);
         if (tempInt < -99) tempInt = -99;
         if (tempInt > 99) tempInt = 99;
-        snprintf(tempStr, sizeof(tempStr), "%d~", tempInt); // ~ as degree placeholder
+        snprintf(tempStr, sizeof(tempStr), "%d~", tempInt);
         tempW = canvas.textWidth(tempStr);
     }
 
+    // Layout: "80% | HH:MM | 25°" centered
     int tw = canvas.textWidth(timeStr);
-    int sep = weather.valid ? 10 : 0; // space before separator
-    int sepW = weather.valid ? 1 : 0; // separator line width
-    int sep2 = weather.valid ? 10 : 0; // space after separator
-    int totalW = tw + sep + sepW + sep2 + tempW;
+    int sepL = hasBatt ? 10 : 0;
+    int sepLW = hasBatt ? 1 : 0;
+    int sepL2 = hasBatt ? 10 : 0;
+    int sepR = weather.valid ? 10 : 0;
+    int sepRW = weather.valid ? 1 : 0;
+    int sepR2 = weather.valid ? 10 : 0;
+    int totalW = battW + sepL + sepLW + sepL2 + tw + sepR + sepRW + sepR2 + tempW;
     int startX = (SCREEN_W - totalW) / 2;
+    int curX = startX;
 
-    canvas.drawString(timeStr, startX, GROUND_Y + 6);
+    if (hasBatt) {
+        canvas.drawString(battStr, curX, GROUND_Y + 6);
+        curX += battW + sepL;
+        canvas.drawFastVLine(curX, GROUND_Y + 8, 12, Color::STATUS_DIM);
+        curX += sepLW + sepL2;
+    }
+
+    canvas.drawString(timeStr, curX, GROUND_Y + 6);
+    curX += tw;
 
     if (weather.valid) {
-        // Draw separator line
-        int sepX = startX + tw + sep;
-        canvas.drawFastVLine(sepX, GROUND_Y + 8, 12, Color::STATUS_DIM);
+        curX += sepR;
+        canvas.drawFastVLine(curX, GROUND_Y + 8, 12, Color::STATUS_DIM);
+        curX += sepRW + sepR2;
 
-        // Draw temperature number
         char numStr[8];
         int tempInt = (int)roundf(weather.temperature);
         if (tempInt < -99) tempInt = -99;
         if (tempInt > 99) tempInt = 99;
         snprintf(numStr, sizeof(numStr), "%d", tempInt);
-        int tempX = sepX + sepW + sep2;
-        canvas.drawString(numStr, tempX, GROUND_Y + 6);
-        // Draw small ° circle instead of font glyph
+        canvas.drawString(numStr, curX, GROUND_Y + 6);
         int numW = canvas.textWidth(numStr);
-        canvas.drawCircle(tempX + numW + 3, GROUND_Y + 8, 2, Color::CLOCK_TEXT);
+        canvas.drawCircle(curX + numW + 3, GROUND_Y + 8, 2, Color::CLOCK_TEXT);
     }
 }
 
@@ -706,7 +735,9 @@ void Companion::drawStatusText(M5Canvas& canvas) {
     canvas.setTextColor(Color::STATUS_DIM);
     canvas.setTextSize(1);
     canvas.drawString(statusStr, 4, 4);
-    canvas.drawString("[TAB] chat", SCREEN_W - 60, 4);
+    canvas.setTextDatum(TR_DATUM);
+    canvas.drawString("[Tab]chat", SCREEN_W - 2, 4);
+    canvas.setTextDatum(TL_DATUM);
 }
 
 // ── Accessories ──
@@ -890,16 +921,13 @@ void playBootAnimation(M5Canvas& canvas) {
 // ══════════════════════════════════════════════════════════════
 
 void playTransition(M5Canvas& canvas, bool toChat) {
-    // Slide transition: wipe left (to chat) or right (to companion)
-    int dir = toChat ? -1 : 1;
-
-    // Capture isn't possible, so just do a quick pixel wipe
+    // Vertical wipe: top-down when entering chat, bottom-up when leaving
     for (int step = 0; step < 8; step++) {
-        int x = step * (SCREEN_W / 8);
+        int h = (step + 1) * (SCREEN_H / 8);
         if (toChat) {
-            canvas.fillRect(0, 0, x + SCREEN_W / 8, SCREEN_H, Color::BLACK);
+            canvas.fillRect(0, 0, SCREEN_W, h, Color::BLACK);
         } else {
-            canvas.fillRect(SCREEN_W - x - SCREEN_W / 8, 0, x + SCREEN_W / 8, SCREEN_H, Color::BLACK);
+            canvas.fillRect(0, SCREEN_H - h, SCREEN_W, h, Color::BLACK);
         }
         canvas.pushSprite(0, 0);
         delay(25);

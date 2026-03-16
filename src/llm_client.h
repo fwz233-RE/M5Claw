@@ -13,6 +13,7 @@ struct LlmToolCall {
 struct LlmResponse {
     char* text;
     size_t text_len;
+    char* raw_content_json;
     LlmToolCall calls[M5CLAW_MAX_TOOL_CALLS];
     int call_count;
     bool tool_use;
