@@ -16,6 +16,11 @@
 #include "context_builder.h"
 #include "dashscope_stt.h"
 #include "dashscope_tts.h"
+#include "message_bus.h"
+#include "feishu_bot.h"
+#include "cron_service.h"
+#include "heartbeat.h"
+#include "skill_loader.h"
 #include <esp_heap_caps.h>
 #include "soc/rtc_cntl_reg.h"
 
@@ -46,6 +51,15 @@
 #ifndef USER_LLM_PATH
 #define USER_LLM_PATH ""
 #endif
+#ifndef USER_FEISHU_APP_ID
+#define USER_FEISHU_APP_ID ""
+#endif
+#ifndef USER_FEISHU_APP_SECRET
+#define USER_FEISHU_APP_SECRET ""
+#endif
+#ifndef USER_GLM_SEARCH_KEY
+#define USER_GLM_SEARCH_KEY ""
+#endif
 
 M5Canvas canvas(&M5Cardputer.Display);
 Companion companion;
@@ -71,7 +85,7 @@ static unsigned long recordingStartMs = 0;
 static bool ttsPlaying = false;
 static size_t ttsSamples = 0;
 
-static const size_t STT_CHUNK_SAMPLES = 1600; // 100ms at 16kHz = 3.2KB
+static const size_t STT_CHUNK_SAMPLES = 1600;
 static int16_t* sttChunkBuf = nullptr;
 
 void enterSetupMode();
@@ -89,6 +103,7 @@ String stopVoiceRecording();
 void streamVoiceData();
 void fillBuildTimeDefaults();
 void processSerialCommands();
+void dispatchOutbound();
 
 static void onAgentResponse(const char* text);
 static volatile bool agentResponseReady = false;
@@ -108,15 +123,18 @@ static void setIfEmpty(void (*setter)(const String&), const String& current, con
 }
 
 void fillBuildTimeDefaults() {
-    setIfEmpty(Config::setSSID,         Config::getSSID(),         USER_WIFI_SSID);
-    setIfEmpty(Config::setPassword,     Config::getPassword(),     USER_WIFI_PASS);
-    setIfEmpty(Config::setLlmApiKey,    Config::getLlmApiKey(),    USER_LLM_KEY);
-    setIfEmpty(Config::setLlmProvider,  Config::getLlmProvider(),  USER_LLM_PROVIDER);
-    setIfEmpty(Config::setLlmModel,     Config::getLlmModel(),     USER_LLM_MODEL);
-    setIfEmpty(Config::setDashScopeKey, Config::getDashScopeKey(), USER_DS_KEY);
-    setIfEmpty(Config::setCity,         Config::getCity(),         USER_CITY);
-    setIfEmpty(Config::setLlmHost,      Config::getLlmHost(),      USER_LLM_HOST);
-    setIfEmpty(Config::setLlmPath,      Config::getLlmPath(),      USER_LLM_PATH);
+    setIfEmpty(Config::setSSID,            Config::getSSID(),            USER_WIFI_SSID);
+    setIfEmpty(Config::setPassword,        Config::getPassword(),        USER_WIFI_PASS);
+    setIfEmpty(Config::setLlmApiKey,       Config::getLlmApiKey(),       USER_LLM_KEY);
+    setIfEmpty(Config::setLlmProvider,     Config::getLlmProvider(),     USER_LLM_PROVIDER);
+    setIfEmpty(Config::setLlmModel,        Config::getLlmModel(),        USER_LLM_MODEL);
+    setIfEmpty(Config::setDashScopeKey,    Config::getDashScopeKey(),    USER_DS_KEY);
+    setIfEmpty(Config::setCity,            Config::getCity(),            USER_CITY);
+    setIfEmpty(Config::setLlmHost,         Config::getLlmHost(),         USER_LLM_HOST);
+    setIfEmpty(Config::setLlmPath,         Config::getLlmPath(),         USER_LLM_PATH);
+    setIfEmpty(Config::setFeishuAppId,     Config::getFeishuAppId(),     USER_FEISHU_APP_ID);
+    setIfEmpty(Config::setFeishuAppSecret, Config::getFeishuAppSecret(), USER_FEISHU_APP_SECRET);
+    setIfEmpty(Config::setGlmSearchKey,    Config::getGlmSearchKey(),    USER_GLM_SEARCH_KEY);
     if (Config::getLlmProvider().length() == 0) Config::setLlmProvider("anthropic");
     if (Config::getLlmModel().length() == 0) Config::setLlmModel(M5CLAW_LLM_DEFAULT_MODEL);
     if (Config::getCity().length() == 0) Config::setCity("Beijing");
@@ -141,6 +159,8 @@ void processSerialCommands() {
         Serial.println("  set_llm_model <model>    - e.g. claude-sonnet-4-20250514");
         Serial.println("  set_ds_key <key>         - Set DashScope key");
         Serial.println("  set_city <city>          - e.g. Beijing");
+        Serial.println("  set_feishu <id> <secret> - Set Feishu bot credentials");
+        Serial.println("  set_glm_key <key>        - Set Zhipu AI search key");
         Serial.println("  show_config              - Show current config");
         Serial.println("  reset_config             - Clear all config");
         Serial.println("  reboot                   - Restart device");
@@ -169,6 +189,19 @@ void processSerialCommands() {
     } else if (cmd == "set_city") {
         Config::setCity(val); Config::save();
         Serial.printf("City: %s\n", val.c_str());
+    } else if (cmd == "set_feishu") {
+        int sp = val.indexOf(' ');
+        if (sp > 0) {
+            Config::setFeishuAppId(val.substring(0, sp));
+            Config::setFeishuAppSecret(val.substring(sp + 1));
+            Config::save();
+            Serial.println("Feishu credentials saved. Reboot to activate.");
+        } else {
+            Serial.println("Usage: set_feishu <app_id> <app_secret>");
+        }
+    } else if (cmd == "set_glm_key") {
+        Config::setGlmSearchKey(val); Config::save();
+        Serial.println("GLM search key saved");
     } else if (cmd == "show_config") {
         Serial.println("=== Current Config ===");
         Serial.printf("  WiFi SSID:     %s\n", Config::getSSID().c_str());
@@ -178,6 +211,9 @@ void processSerialCommands() {
         Serial.printf("  LLM Key:       [%d chars]\n", Config::getLlmApiKey().length());
         Serial.printf("  DashScope Key: [%d chars]\n", Config::getDashScopeKey().length());
         Serial.printf("  City:          %s\n", Config::getCity().c_str());
+        Serial.printf("  Feishu App ID: [%d chars]\n", Config::getFeishuAppId().length());
+        Serial.printf("  Feishu Secret: [%d chars]\n", Config::getFeishuAppSecret().length());
+        Serial.printf("  GLM Search:    [%d chars]\n", Config::getGlmSearchKey().length());
         Serial.printf("  Valid:         %s\n", Config::isValid() ? "YES" : "NO");
     } else if (cmd == "reset_config") {
         Config::reset(); Config::save();
@@ -188,6 +224,21 @@ void processSerialCommands() {
         ESP.restart();
     } else {
         Serial.printf("Unknown command: %s (type 'help')\n", cmd.c_str());
+    }
+}
+
+void dispatchOutbound() {
+    if (WiFi.status() != WL_CONNECTED) return;
+    BusMessage msg;
+    while (MessageBus::popOutbound(&msg, 0)) {
+        if (strcmp(msg.channel, M5CLAW_CHAN_FEISHU) == 0) {
+            if (FeishuBot::isRunning()) {
+                FeishuBot::sendMessage(msg.chat_id, msg.content);
+            } else {
+                Serial.printf("[BUS] Feishu offline, dropped reply to %s\n", msg.chat_id);
+            }
+        }
+        free(msg.content);
     }
 }
 
@@ -233,10 +284,15 @@ void setup() {
     MemoryStore::init();
     Serial.println("[BOOT] SPIFFS OK");
 
+    MessageBus::init();
     SessionMgr::init();
     ToolRegistry::init();
+    SkillLoader::init();
+    CronService::init();
+    Heartbeat::init();
+    FeishuBot::init();
     Agent::init();
-    Serial.println("[BOOT] Agent initialized");
+    Serial.println("[BOOT] All services initialized");
 
     playBootAnimation(canvas);
 
@@ -250,24 +306,37 @@ void setup() {
 void loop() {
     M5Cardputer.update();
 
+    // Feishu incoming → immediately show on chat UI + "thinking..."
+    if (FeishuBot::hasIncomingForDisplay()) {
+        char* incoming = FeishuBot::takeIncomingForDisplay();
+        if (incoming) {
+            if (appMode != AppMode::CHAT) {
+                appMode = AppMode::CHAT;
+                chat.begin(canvas);
+            }
+            char label[256];
+            snprintf(label, sizeof(label), "[feishu] %s", incoming);
+            chat.addMessage(String(label), true);
+            chat.addMessage("thinking...", false);
+            chat.scrollToBottom();
+            free(incoming);
+        }
+    }
+
+    // Local agent response (from keyboard/voice)
     if (agentResponseReady && agentResponseText) {
-        char filtered[512];
-        filterForDisplayBuf(agentResponseText, filtered, sizeof(filtered));
-        chat.appendAIToken(filtered);
+        chat.appendAIToken(agentResponseText);
         chat.onAIResponseComplete();
 
-        if (strlen(agentResponseText) > 0
-            && Config::getDashScopeKey().length() > 0) {
-            const char* shortText = agentResponseText;
-            size_t textLen = strlen(shortText);
-            if (textLen > 200) textLen = 200;
+        if (strlen(agentResponseText) > 0 && Config::getDashScopeKey().length() > 0) {
+            size_t ttsLen = strlen(agentResponseText);
+            if (ttsLen > 200) ttsLen = 200;
             char ttsText[201];
-            memcpy(ttsText, shortText, textLen);
-            ttsText[textLen] = '\0';
+            memcpy(ttsText, agentResponseText, ttsLen);
+            ttsText[ttsLen] = '\0';
 
-            if (!voiceBuffer) initVoiceBuffer();
-            size_t heapAfterBuf = ESP.getFreeHeap();
-            if (voiceBuffer && heapAfterBuf > 80000) {
+            initVoiceBuffer();
+            if (voiceBuffer) {
                 M5Cardputer.Speaker.end();
                 delay(50);
                 M5Cardputer.Mic.end();
@@ -282,9 +351,6 @@ void loop() {
                 } else {
                     releaseVoiceBuffer();
                 }
-            } else {
-                Serial.printf("[TTS] Skipped: heap=%d after buf alloc (need >80000)\n", (int)heapAfterBuf);
-                releaseVoiceBuffer();
             }
         }
 
@@ -294,10 +360,27 @@ void loop() {
         agentResponseReady = false;
     }
 
+    // External (feishu) AI response ready → update the "thinking..." bubble
+    if (Agent::hasExternalConv()) {
+        ExternalConv conv = Agent::takeExternalConv();
+        if (conv.aiText) {
+            if (appMode != AppMode::CHAT) {
+                appMode = AppMode::CHAT;
+                chat.begin(canvas);
+            }
+            chat.appendAIToken(conv.aiText);
+            chat.onAIResponseComplete();
+        }
+        free(conv.userText);
+        free(conv.aiText);
+    }
+
     if (ttsPlaying && !M5Cardputer.Speaker.isPlaying()) {
         ttsPlaying = false;
         releaseVoiceBuffer();
     }
+
+    dispatchOutbound();
 
     switch (appMode) {
         case AppMode::SETUP:
@@ -370,6 +453,7 @@ void loop() {
             if (!offlineMode && fnDown && fnAlone && !voiceRecording
                 && !Agent::isBusy() && !ttsPlaying
                 && Config::getDashScopeKey().length() > 0) {
+                initVoiceBuffer();
                 chat.update(canvas);
                 canvas.fillRect(0, SCREEN_H - 16, SCREEN_W, 16, rgb565(50, 50, 200));
                 canvas.setTextColor(Color::WHITE);
@@ -482,6 +566,11 @@ void loop() {
                 canvas.setTextColor(Color::WHITE);
                 canvas.setTextSize(1);
                 canvas.drawString("Speaking...", 85, SCREEN_H - 12);
+            } else if (Agent::isBusy()) {
+                canvas.fillRect(0, SCREEN_H - 16, SCREEN_W, 16, rgb565(80, 80, 80));
+                canvas.setTextColor(rgb565(200, 200, 200));
+                canvas.setTextSize(1);
+                canvas.drawString("Processing...", 78, SCREEN_H - 12);
             }
             canvas.pushSprite(0, 0);
             break;
@@ -497,43 +586,85 @@ static void onAgentResponse(const char* text) {
     agentResponseReady = true;
 }
 
+static bool s_feishuPausedForVoice = false;
+
+static void drawProgressBar(const char* label, int percent) {
+    canvas.fillScreen(rgb565(30, 30, 40));
+    canvas.setTextColor(Color::WHITE);
+    canvas.setTextSize(1);
+    canvas.drawString(label, (SCREEN_W - strlen(label) * 6) / 2, 45);
+
+    int barW = 160, barH = 10;
+    int barX = (SCREEN_W - barW) / 2, barY = 68;
+    canvas.drawRect(barX, barY, barW, barH, Color::WHITE);
+    int fillW = (barW - 2) * percent / 100;
+    if (fillW > 0) canvas.fillRect(barX + 1, barY + 1, fillW, barH - 2, rgb565(80, 180, 80));
+
+    char pct[8];
+    snprintf(pct, sizeof(pct), "%d%%", percent);
+    canvas.drawString(pct, (SCREEN_W - strlen(pct) * 6) / 2, barY + 14);
+    canvas.pushSprite(0, 0);
+}
+
 void initVoiceBuffer() {
     if (voiceBuffer) return;
 
-    const size_t TLS_RESERVE = 50 * 1024;
-    const size_t MAX_SAMPLES = 80000;
+    drawProgressBar("Loading voice...", 10);
+
+    if (FeishuBot::isRunning()) {
+        FeishuBot::stop();
+        s_feishuPausedForVoice = true;
+        drawProgressBar("Loading voice...", 30);
+    }
+    delay(100);
+
+    drawProgressBar("Loading voice...", 50);
+
+    const size_t TLS_RESERVE = 35 * 1024;
+    const size_t MAX_SAMPLES = 60000;
     const size_t MIN_SAMPLES = 8000;
 
+    size_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
     size_t freeHeap = ESP.getFreeHeap();
-    if (freeHeap <= TLS_RESERVE) {
-        Serial.printf("[VOICE] Buffer: FAIL, heap=%d too low (need %d reserved)\n",
-                      (int)freeHeap, (int)TLS_RESERVE);
-        return;
-    }
+    size_t usable = (largestBlock > TLS_RESERVE) ? largestBlock - TLS_RESERVE : 0;
 
-    size_t maxBytes = freeHeap - TLS_RESERVE;
-    size_t maxSamples = maxBytes / sizeof(int16_t);
+    size_t maxSamples = usable / sizeof(int16_t);
     if (maxSamples > MAX_SAMPLES) maxSamples = MAX_SAMPLES;
     maxSamples = (maxSamples / 1000) * 1000;
 
     if (maxSamples < MIN_SAMPLES) {
-        Serial.printf("[VOICE] Buffer: FAIL, only %d samples possible\n", (int)maxSamples);
+        Serial.printf("[VOICE] Buffer: FAIL, largest_block=%d heap=%d\n",
+                      (int)largestBlock, (int)freeHeap);
+        drawProgressBar("Voice: low memory", 100);
+        delay(800);
+        if (s_feishuPausedForVoice) { FeishuBot::resume(); s_feishuPausedForVoice = false; }
         return;
     }
 
     size_t bytes = maxSamples * sizeof(int16_t);
     voiceBuffer = (int16_t*)heap_caps_malloc(bytes, MALLOC_CAP_8BIT);
+    while (!voiceBuffer && maxSamples > MIN_SAMPLES) {
+        maxSamples -= 4000;
+        bytes = maxSamples * sizeof(int16_t);
+        voiceBuffer = (int16_t*)heap_caps_malloc(bytes, MALLOC_CAP_8BIT);
+    }
+
+    drawProgressBar("Loading voice...", 90);
+
     if (voiceBuffer) {
         voiceBufferSamples = maxSamples;
-        Serial.printf("[VOICE] Buffer: OK, %d samples (%.2fs @24k / %.2fs @16k) heap=%d\n",
+        Serial.printf("[VOICE] Buffer: OK, %d samples (%.1fs @24k) heap=%d\n",
                       (int)voiceBufferSamples,
                       (float)voiceBufferSamples / M5CLAW_TTS_SAMPLE_RATE,
-                      (float)voiceBufferSamples / M5CLAW_STT_SAMPLE_RATE,
                       ESP.getFreeHeap());
+        drawProgressBar("Voice ready!", 100);
     } else {
         voiceBufferSamples = 0;
-        Serial.printf("[VOICE] Buffer: FAIL, malloc(%d) failed, heap=%d\n",
-                      (int)bytes, (int)freeHeap);
+        Serial.printf("[VOICE] Buffer: FAIL, heap=%d largest=%d\n",
+                      (int)freeHeap, (int)largestBlock);
+        drawProgressBar("Voice: alloc failed", 100);
+        delay(800);
+        if (s_feishuPausedForVoice) { FeishuBot::resume(); s_feishuPausedForVoice = false; }
     }
 }
 
@@ -543,6 +674,11 @@ void releaseVoiceBuffer() {
     voiceBuffer = nullptr;
     voiceBufferSamples = 0;
     recordedSamples = 0;
+    if (s_feishuPausedForVoice) {
+        FeishuBot::resume();
+        s_feishuPausedForVoice = false;
+        Serial.printf("[VOICE] Buffer freed, Feishu resumed, heap=%d\n", ESP.getFreeHeap());
+    }
 }
 
 void startVoiceRecording() {
@@ -852,9 +988,9 @@ void initOnlineServices() {
     canvas.fillScreen(Color::BG_DAY);
     canvas.setTextColor(Color::CHAT_AI);
     canvas.setTextSize(1);
-    canvas.drawString("WiFi connected!", 70, 45);
-    canvas.drawString(WiFi.localIP().toString().c_str(), 80, 60);
-    canvas.drawString("Initializing...", 75, 80);
+    canvas.drawString("WiFi connected!", 70, 40);
+    canvas.drawString(WiFi.localIP().toString().c_str(), 80, 55);
+    canvas.drawString("Initializing services...", 55, 75);
     canvas.pushSprite(0, 0);
 
     llm_client_init(Config::getLlmApiKey().c_str(),
@@ -870,6 +1006,13 @@ void initOnlineServices() {
 
     weatherClient.begin(Config::getCity());
     Agent::start();
+
+    // Start Feishu bot (lazy: only if credentials configured)
+    FeishuBot::start();
+
+    // Start background services
+    CronService::start();
+    Heartbeat::start();
 
     delay(500);
 }

@@ -1,310 +1,229 @@
 # M5Claw
 
-**MimiClaw AI Agent on M5Stack Cardputer**
-
-将 [MimiClaw](https://github.com/pprp/mimiclaw) 的 AI Agent 核心移植到 M5Stack Cardputer 硬件上，融合 [ClawPuter](https://github.com/nicebug/ClawPuter) 的像素宠物 UI 和硬件交互层，并通过阿里 DashScope API 实现高性能实时语音识别（STT）和语音合成（TTS）。
+在 M5Stack Cardputer 上运行的全功能 AI 助手，融合本地交互与云端智能。
 
 ## 功能特性
 
-### 像素宠物伴侣
-- 小龙虾像素角色 + 多种动画（待机、开心、睡觉、说话、伸懒腰、东张西望）
-- 实时天气特效（雨、雪、雾、雷暴）+ 天气配饰
-- 日夜循环 + 时光倒流天空
-- 键盘方向控制（`;` 上 `.` 下 `,` 左 `/` 右）
-- 30 秒无操作自动入睡
+### AI 对话
+- **ReAct Agent**：支持多轮工具调用的智能代理循环
+- **多模型支持**：Anthropic Claude / OpenAI 兼容 API（含 MiniMax 等第三方）
+- **语音交互**：DashScope 实时语音识别 + TTS 语音合成
+- **持久记忆**：SPIFFS 存储的长期记忆、每日笔记、对话历史
 
-### AI Agent 聊天
-- 支持 Anthropic Claude 和 OpenAI GPT
-- ReAct Agent 循环 + 工具调用（最多 10 轮迭代）
-- 内置工具：获取时间、文件读写、网页搜索
-- 长期记忆系统（SOUL.md / USER.md / MEMORY.md）
-- 会话历史持久化（SPIFFS）
-- `/draw` 和 `/draw16` 像素画生成
+### 飞书机器人
+- **WebSocket 长连接**：自动重连的飞书消息通道
+- **双向通信**：接收飞书消息 → AI 处理 → 自动回复
+- **私聊/群聊**：支持 DM 和群组消息路由
+- **消息去重**：FNV-1a 哈希环形缓冲区防重复处理
+- **主动推送**：AI 可通过 `feishu_send` 工具主动发送消息
 
-### 语音交互
-- **语音识别**：DashScope fun-asr-realtime（WebSocket 实时转写）
-- **语音合成**：DashScope qwen3-tts-flash（HTTP 流式 PCM）
-- 按住 Fn 说话，松开自动转写
-- AI 回复自动 TTS 朗读，任意键可中断
+### 网络搜索
+- **智谱 AI GLM Search**：基于智谱 AI Web Search API 的实时网络搜索
+- **搜索引擎**：`search_pro_quark`（夸克版，0.05元/次）
+- **结构化结果**：返回标题、链接、摘要，便于 AI 分析
 
-### 设备与配网
-- 首次启动 Setup 向导配置所有参数
-- Fn+R 随时重新配置
-- 支持双 WiFi（主 WiFi 失败自动切备用）
-- 离线模式（仅伴侣功能可用）
+### 定时任务 (Cron)
+- **周期任务**：按固定间隔执行（`every` 模式）
+- **定时任务**：在指定时间点执行（`at` 模式，一次性）
+- **SPIFFS 持久化**：重启后任务不丢失
+- **多通道投递**：任务触发消息可路由到本地或飞书
+
+### 心跳检测
+- 每 30 分钟检查 `HEARTBEAT.md`
+- 发现待办事项自动推送给 AI 处理
+
+### 技能系统
+- 可扩展的 Markdown 技能文件（`skills/*.md`）
+- 自动扫描并注入 system prompt
+- AI 可自行创建新技能
+
+### 本地交互
+- **像素宠物**：Mode-7 公路背景 + 天气特效（雨/雪/雾/雷）
+- **聊天界面**：UTF-8 多语言支持，滚动消息列表
+- **键盘输入**：全键盘 + 快捷键操作
+
+### 工具集
+| 工具 | 说明 |
+|------|------|
+| `get_current_time` | 获取当前日期时间 |
+| `read_file` | 读取设备存储文件 |
+| `write_file` | 写入/覆盖文件 |
+| `edit_file` | 查找替换文件内容 |
+| `list_dir` | 列出目录文件 |
+| `web_search` | 智谱 AI 网络搜索 |
+| `cron_add` | 添加定时/周期任务 |
+| `cron_list` | 列出所有定时任务 |
+| `cron_remove` | 删除定时任务 |
+| `feishu_send` | 主动发送飞书消息 |
 
 ## 硬件要求
 
-| 项目 | 规格 |
-|------|------|
-| 设备 | M5Stack Cardputer |
-| MCU | ESP32-S3（双核 240MHz） |
-| RAM | 320KB SRAM + 8MB PSRAM |
-| Flash | 8MB |
-| 屏幕 | 1.14" IPS 240x135 |
-| 键盘 | 56 键矩阵 |
-| 麦克风 | PDM (SPM1423) |
-| 扬声器 | 与麦克风共享 GPIO 43 |
+- M5Stack Cardputer (ESP32-S3, 8MB PSRAM)
+- 内置键盘、麦克风、扬声器、240x135 屏幕
 
----
+## 快速开始
 
-## 编译烧录教程
+### 1. 配置
 
-### 方法一：使用 VS Code + PlatformIO（推荐）
+编辑 `user_config.ini`：
 
-这是最简单的方式，全图形化操作。
+```ini
+[user]
+wifi_ssid = 你的WiFi名称
+wifi_pass = WiFi密码
 
-#### 第一步：安装软件
+llm_provider = anthropic
+llm_model = claude-sonnet-4-20250514
+llm_api_key = sk-你的API密钥
 
-1. 下载安装 [VS Code](https://code.visualstudio.com/)
-2. 打开 VS Code，点击左侧扩展图标（或按 `Ctrl+Shift+X`）
-3. 搜索 **PlatformIO IDE**，点击安装
-4. 等待安装完成（首次需要几分钟下载工具链），VS Code 底部状态栏会出现 PlatformIO 图标
+; 自定义 LLM 端点（可选，如 MiniMax）
+; llm_host = api.minimaxi.com
+; llm_path = /anthropic/v1/messages
 
-#### 第二步：获取代码
+; 语音识别/合成（可选）
+dashscope_key = 你的DashScope密钥
+
+; 飞书机器人（可选）
+feishu_app_id = 你的飞书应用ID
+feishu_app_secret = 你的飞书应用密钥
+
+; 网络搜索（可选）
+glm_search_key = 你的智谱AI密钥
+
+city = Beijing
+```
+
+### 2. 编译烧录
 
 ```bash
-git clone https://github.com/fwz233-RE/M5Claw.git
+pio run -t uploadfs    # 上传 SPIFFS 数据
+pio run -t upload      # 编译并烧录固件
+pio device monitor     # 查看串口日志
 ```
 
-或者直接在 GitHub 页面点击 **Code → Download ZIP**，解压到任意目录。
+### 3. 串口配置（运行时）
 
-#### 第三步：打开项目
-
-1. VS Code 菜单：**文件 → 打开文件夹**
-2. 选择 `M5Claw` 文件夹（包含 `platformio.ini` 的那个目录）
-3. PlatformIO 会自动识别项目，首次打开时会自动下载 ESP32 工具链和依赖库（需要几分钟）
-
-#### 第四步：连接设备
-
-1. 用 **USB-C 数据线**将 M5Stack Cardputer 连接到电脑
-2. Windows 用户：如果设备管理器中没出现 COM 端口，需要安装 [CP210x 驱动](https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers)
-3. Mac/Linux 用户：通常免驱，设备会出现为 `/dev/ttyUSB0` 或 `/dev/cu.usbmodem*`
-
-#### 第五步：编译并烧录
-
-**方式 A — 点击按钮（推荐）：**
-
-VS Code 底部状态栏有 PlatformIO 工具按钮：
+连接串口后输入 `help` 查看所有命令：
 
 ```
- ✓ Build    →  Upload    🔌 Serial Monitor
+set_wifi <ssid> <pass>      设置 WiFi
+set_llm_key <key>           设置 LLM API 密钥
+set_llm_provider <p>        设置 LLM 提供商
+set_llm_model <model>       设置模型
+set_ds_key <key>            设置 DashScope 密钥
+set_feishu <id> <secret>    设置飞书应用凭证
+set_glm_key <key>           设置智谱搜索密钥
+set_city <city>             设置城市
+show_config                 显示当前配置
+reset_config                清除所有配置
+reboot                      重启设备
 ```
 
-- 点击 **→ (Upload)** 即可一键编译+烧录
-- 点击 **🔌 (Serial Monitor)** 可查看设备日志输出
+## 飞书机器人配置
 
-**方式 B — 命令行：**
+1. 访问 [飞书开放平台](https://open.feishu.cn/app) 创建应用
+2. 启用**机器人**能力
+3. 在「事件与回调」中选择 **长连接** 模式
+4. 添加事件订阅：`im.message.receive_v1`
+5. 发布应用版本
+6. 将 `App ID` 和 `App Secret` 填入 `user_config.ini` 或通过串口 `set_feishu` 命令设置
 
-```bash
-cd M5Claw
+## 智谱 AI 搜索配置
 
-# 仅编译（不烧录）
-pio run
-
-# 编译 + 烧录固件
-pio run -t upload
-
-# 烧录 SPIFFS 数据文件（AI 人设/记忆）
-pio run -t uploadfs
-
-# 打开串口监视器查看日志
-pio device monitor
-```
-
-#### 第六步：烧录 SPIFFS 数据
-
-SPIFFS 中存储了 AI 的人设和记忆文件，首次使用需要单独烧录：
-
-```bash
-pio run -t uploadfs
-```
-
-或在 VS Code 中：**PlatformIO 侧边栏 → Project Tasks → Upload Filesystem Image**
-
-> 如果跳过这一步，设备启动后会自动创建空文件，AI 功能仍可使用，但没有预设人设。
-
-### 方法二：使用命令行（无需 VS Code）
-
-#### 安装 PlatformIO CLI
-
-```bash
-# Python 3.6+ 环境
-pip install platformio
-
-# 验证安装
-pio --version
-```
-
-#### 完整编译烧录流程
-
-```bash
-# 1. 克隆代码
-git clone https://github.com/fwz233-RE/M5Claw.git
-cd M5Claw
-
-# 2. 编译固件（首次会自动下载工具链，需要几分钟）
-pio run
-
-# 3. 连接 Cardputer 到 USB，烧录固件
-pio run -t upload
-
-# 4. 烧录 SPIFFS 数据文件
-pio run -t uploadfs
-
-# 5.（可选）查看串口日志
-pio device monitor
-```
-
-#### 指定串口端口
-
-如果电脑连了多个串口设备，需要手动指定端口：
-
-```bash
-# Windows
-pio run -t upload --upload-port COM3
-
-# Mac
-pio run -t upload --upload-port /dev/cu.usbmodem3101
-
-# Linux
-pio run -t upload --upload-port /dev/ttyUSB0
-```
-
-### 方法三：使用 Arduino IDE
-
-1. 安装 [Arduino IDE 2.x](https://www.arduino.cc/en/software)
-2. **文件 → 首选项**，附加开发板管理器网址中添加：
-   ```
-   https://m5stack.oss-cn-shenzhen.aliyuncs.com/resource/arduino/package_m5stack_index.json
-   ```
-3. **工具 → 开发板管理器**，搜索 `M5Stack` 并安装
-4. **工具 → 管理库**，安装以下库：
-   - `M5Cardputer`
-   - `ArduinoJson`
-   - `WebSockets`（by Links2004）
-5. **工具 → 开发板** 选择 `M5Stack-StampS3`
-6. **工具** 中设置：
-   - Flash Size: `8MB`
-   - Partition Scheme: `自定义`（需手动导入 `partitions.csv`）
-   - PSRAM: `OPI PSRAM`
-   - USB CDC On Boot: `Enabled`
-7. 打开 `src/main.cpp`，编译上传
-
-> Arduino IDE 方式较繁琐，推荐使用 PlatformIO。
-
----
-
-## 首次配置
-
-设备烧录完成后，USB 拔掉重新上电（或按 RST 按钮），设备启动后会进入 **Setup 向导**：
-
-| 步骤 | 配置项 | 说明 |
-|------|--------|------|
-| 1/7 | WiFi SSID | 你的 WiFi 名称（区分大小写） |
-| 2/7 | WiFi Password | WiFi 密码 |
-| 3/7 | LLM API Key | Anthropic 或 OpenAI 的 API Key |
-| 4/7 | Provider | 输入 `anthropic` 或 `openai` |
-| 5/7 | Model | 模型名称，如 `claude-sonnet-4-20250514` 或 `gpt-4o` |
-| 6/7 | DashScope Key | 阿里百炼 API Key（用于语音识别和合成），去 [百炼控制台](https://bailian.console.aliyun.com/) 获取 |
-| 7/7 | City | 天气城市名（英文），如 `Beijing`、`Shanghai`、`Tokyo` |
-
-**操作说明：**
-- 用键盘输入文字
-- 按 **Enter** 确认当前项并进入下一步
-- 按 **Enter**（不输入任何内容）保留当前已有值
-- 按 **Tab** 跳过配置直接进入离线模式
-- 配完成后设备自动连接 WiFi 并进入伴侣模式
-
-> 所有 API Key 仅存储在设备本地 NVS 中，不会上传到任何服务器，也不会出现在代码里。
-
-### API Key 获取方式
-
-| API Key | 获取地址 | 说明 |
-|---------|----------|------|
-| Anthropic | https://console.anthropic.com/settings/keys | Claude 模型 |
-| OpenAI | https://platform.openai.com/api-keys | GPT 模型 |
-| DashScope | https://bailian.console.aliyun.com/#/api-key | 语音识别+合成，新用户有免费额度 |
-
----
+1. 访问 [智谱 AI 开放平台](https://open.bigmodel.cn/usercenter/apikeys) 获取 API Key
+2. 填入 `user_config.ini` 的 `glm_search_key` 或通过串口 `set_glm_key` 命令设置
+3. 使用 `search_std` 引擎（0.01元/次）
 
 ## 操作指南
 
-| 按键 | 伴侣模式 | 聊天模式 |
-|------|----------|----------|
-| Tab | 切换到聊天 | 切换到伴侣 |
-| Fn (按住) | — | 语音输入 |
-| Enter | 开心动画 | 发送消息 |
-| 空格 | 开心动画 | 输入空格 |
-| `;` `.` `,` `/` | 方向移动 | — |
-| Fn + `;` | — | 向上滚动 |
-| Fn + `/` | — | 向下滚动 |
-| Fn + W | 天气模拟 | — |
-| Fn + R | 重新配置 | — |
-| 1-8 | 切换模拟天气 | — |
+### 伴侣模式
+- `Tab` — 切换到聊天模式
+- `Fn+W` — 切换天气模拟
+- `Fn+R` — 重置 WiFi
+- `1-8` — 天气模拟模式下切换天气类型
 
----
+### 聊天模式
+- `Enter` — 发送消息
+- `Delete` — 退格
+- `Tab` — 向上滚动
+- `Ctrl` — 向下滚动
+- `Alt` — 返回伴侣模式
+- `Fn (长按)` — 语音输入
 
-## 常见问题
+## 内存管理
 
-### Q: 编译报错 "fatal error: M5Cardputer.h: No such file"
-PlatformIO 没有自动下载依赖库。运行 `pio lib install` 或删除 `.pio` 目录后重新编译。
+M5Claw 在 ESP32-S3 有限的内存环境下做了大量优化：
 
-### Q: 上传失败 "A]fatal error occurred: Failed to connect"
-1. 确认 USB 线是**数据线**（不是纯充电线）
-2. 尝试按住 Cardputer 上的 **G0 按钮**，同时按一下 **RST 按钮**，松开 G0 进入下载模式
-3. Windows 用户检查是否安装了 CP210x 驱动
-
-### Q: 设备启动后屏幕全黑
-串口监视器检查日志（`pio device monitor`），可能是 WiFi 连接失败。按 **Tab** 进入离线模式查看是否正常。
-
-### Q: 语音识别没反应
-确认 DashScope API Key 已正确配置。在聊天模式下**按住 Fn**说话，**松开后**自动识别。如果 DashScope Key 未设置，语音功能会被禁用。
-
-### Q: 如何重新配置 WiFi 和 Key
-在伴侣模式下按 **Fn+R**，设备会清除配置并重新进入 Setup 向导。
-
----
+- 所有 >1KB 缓冲区优先分配 PSRAM
+- 飞书/搜索/Cron 等服务仅在配置了密钥时才初始化
+- 搜索响应缓冲区按需分配，用完即释放
+- 语音缓冲区动态计算可用内存，自动适配大小
+- 工具输出缓冲区在 Agent 任务中复用
 
 ## 项目结构
 
 ```
 M5Claw/
 ├── src/
-│   ├── main.cpp              # 入口 + 模式切换
-│   ├── m5claw_config.h       # 全局配置常量
-│   ├── config.h/cpp          # NVS 持久化配置
-│   ├── utils.h               # 屏幕/颜色/Timer 工具
-│   ├── companion.h/cpp       # 像素宠物 + 天气特效
-│   ├── chat.h/cpp            # 聊天 UI + 像素画
-│   ├── sprites.h             # 像素精灵素材
-│   ├── weather_client.h/cpp  # Open-Meteo 天气 API
-│   ├── agent.h/cpp           # ReAct Agent 循环
-│   ├── llm_client.h/cpp      # Anthropic/OpenAI LLM 客户端
-│   ├── context_builder.h/cpp # System Prompt 构建
-│   ├── tool_registry.h/cpp   # 工具注册与执行
-│   ├── memory_store.h/cpp    # SPIFFS 文件存储
-│   ├── session_mgr.h/cpp     # 会话历史管理
-│   ├── dashscope_stt.h/cpp   # DashScope 语音识别
-│   └── dashscope_tts.h/cpp   # DashScope 语音合成
-├── data/                     # SPIFFS 预烧录数据
-│   ├── config/SOUL.md        # AI 人设
-│   ├── config/USER.md        # 用户信息
-│   └── memory/MEMORY.md      # 长期记忆
-├── platformio.ini            # PlatformIO 构建配置
-├── partitions.csv            # ESP32 分区表
-├── .gitignore
-├── LICENSE
+│   ├── main.cpp              主程序入口、模式切换、语音
+│   ├── config.cpp/h          NVS 配置管理
+│   ├── companion.cpp/h       像素宠物 + 天气特效
+│   ├── chat.cpp/h            聊天界面
+│   ├── agent.cpp/h           多通道 ReAct Agent
+│   ├── llm_client.cpp/h      LLM HTTP 客户端
+│   ├── context_builder.cpp/h System Prompt 构建
+│   ├── tool_registry.cpp/h   工具定义与执行
+│   ├── memory_store.cpp/h    SPIFFS 文件访问
+│   ├── session_mgr.cpp/h     对话历史管理
+│   ├── message_bus.cpp/h     FreeRTOS 消息总线
+│   ├── feishu_bot.cpp/h      飞书 WebSocket 机器人
+│   ├── cron_service.cpp/h    定时任务服务
+│   ├── heartbeat.cpp/h       心跳检测服务
+│   ├── skill_loader.cpp/h    技能加载系统
+│   ├── weather_client.cpp/h  天气客户端
+│   ├── dashscope_stt.cpp/h   语音识别
+│   ├── dashscope_tts.cpp/h   语音合成
+│   ├── sprites.h             像素精灵图
+│   ├── utils.h               工具函数
+│   └── m5claw_config.h       编译时常量
+├── data/
+│   ├── config/SOUL.md        AI 人格设定
+│   ├── config/USER.md        用户信息
+│   ├── memory/MEMORY.md      长期记忆
+│   └── skills/               技能文件目录
+├── user_config.ini           用户配置（编译时注入）
+├── load_config.py            配置注入脚本
+├── platformio.ini            PlatformIO 构建配置
+├── partitions.csv            分区表
 └── README.md
 ```
 
-## 致谢
+## 架构
 
-- [ClawPuter](https://github.com/bryant24hao/ClawPuter) — 像素宠物 UI 和 M5Cardputer 硬件交互
-- [MimiClaw](https://github.com/memovai/mimiclaw/blob/main/README_CN.md) — AI Agent 核心架构
-- [DashScope](https://help.aliyun.com/zh/model-studio/) — 语音识别和语音合成 API，新用户赠送免费额度
-- [M5Stack](https://m5stack.com/) — Cardputer 硬件平台
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      main.cpp (loop)                         │
+│      SETUP | COMPANION | CHAT + 语音录制/TTS + 消息分发       │
+└─────────────────────────┬───────────────────────────────────┘
+                          │
+      ┌───────────────────┼───────────────────┐
+      │                   │                   │
+      ▼                   ▼                   ▼
+┌───────────┐    ┌──────────────┐    ┌──────────────────┐
+│ Companion │    │   Chat UI    │    │ Agent (Core 1)   │
+│ 像素宠物   │    │   聊天界面    │    │ ReAct + 工具调用  │
+└─────┬─────┘    └──────┬───────┘    └────────┬─────────┘
+      │                 │                     │
+      ▼                 ▼                     ▼
+┌───────────┐    ┌──────────────┐    ┌──────────────────┐
+│ Weather   │    │ SessionMgr   │    │ MessageBus       │
+│ Client    │    │ MemoryStore  │    │ ┌─ FeishuBot     │
+└───────────┘    └──────────────┘    │ ├─ CronService   │
+                                     │ ├─ Heartbeat     │
+                                     │ └─ SkillLoader   │
+                                     └──────────────────┘
+```
 
 ## 许可证
 
-GPL-3.0
+MIT License

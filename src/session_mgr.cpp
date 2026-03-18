@@ -4,9 +4,16 @@
 #include <ArduinoJson.h>
 
 static String sessionPath(const char* chat_id) {
-    String path = M5CLAW_SESSION_DIR;
-    path += "/";
-    path += chat_id;
+    const char* id = chat_id;
+    char hashed[16];
+    if (strlen(chat_id) > 16) {
+        uint32_t h = 5381;
+        for (const char* p = chat_id; *p; p++) h = h * 33 + (unsigned char)*p;
+        snprintf(hashed, sizeof(hashed), "h%08x", h);
+        id = hashed;
+    }
+    String path = "/sessions/";
+    path += id;
     path += ".jsonl";
     return path;
 }

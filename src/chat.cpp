@@ -133,6 +133,7 @@ void Chat::onAIResponseComplete() {
     scrollToBottom();
 }
 
+
 bool Chat::isAtBottom() const {
     int maxScroll = totalContentH - MSG_AREA_H;
     if (maxScroll <= 0) return true;

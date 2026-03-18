@@ -10,15 +10,18 @@ else:
     cp.read(config_file, encoding="utf-8")
 
     mapping = {
-        "wifi_ssid":     "USER_WIFI_SSID",
-        "wifi_pass":     "USER_WIFI_PASS",
-        "llm_api_key":   "USER_LLM_KEY",
-        "llm_provider":  "USER_LLM_PROVIDER",
-        "llm_model":     "USER_LLM_MODEL",
-        "llm_host":      "USER_LLM_HOST",
-        "llm_path":      "USER_LLM_PATH",
-        "dashscope_key": "USER_DS_KEY",
-        "city":          "USER_CITY",
+        "wifi_ssid":        "USER_WIFI_SSID",
+        "wifi_pass":        "USER_WIFI_PASS",
+        "llm_api_key":      "USER_LLM_KEY",
+        "llm_provider":     "USER_LLM_PROVIDER",
+        "llm_model":        "USER_LLM_MODEL",
+        "llm_host":         "USER_LLM_HOST",
+        "llm_path":         "USER_LLM_PATH",
+        "dashscope_key":    "USER_DS_KEY",
+        "city":             "USER_CITY",
+        "feishu_app_id":    "USER_FEISHU_APP_ID",
+        "feishu_app_secret":"USER_FEISHU_APP_SECRET",
+        "glm_search_key":   "USER_GLM_SEARCH_KEY",
     }
 
     flags = []

@@ -24,6 +24,11 @@ namespace Config {
 
     // Search
     const String& getSearchKey();
+    const String& getGlmSearchKey();
+
+    // Feishu
+    const String& getFeishuAppId();
+    const String& getFeishuAppSecret();
 
     void setSSID(const String& ssid);
     void setPassword(const String& password);
@@ -37,6 +42,9 @@ namespace Config {
     void setLlmPath(const String& path);
     void setDashScopeKey(const String& key);
     void setSearchKey(const String& key);
+    void setGlmSearchKey(const String& key);
+    void setFeishuAppId(const String& id);
+    void setFeishuAppSecret(const String& secret);
 
     bool isValid();
 }

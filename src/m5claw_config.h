@@ -17,16 +17,51 @@
 #define M5CLAW_LLM_OPENAI_URL          "api.openai.com"
 #define M5CLAW_LLM_OPENAI_PATH         "/v1/chat/completions"
 #define M5CLAW_LLM_API_VERSION         "2023-06-01"
-#define M5CLAW_LLM_RESPONSE_BUF        (8 * 1024)
+#define M5CLAW_LLM_RESPONSE_BUF        (4 * 1024)
 
-// Memory / SPIFFS
-#define M5CLAW_SPIFFS_BASE             "/spiffs"
-#define M5CLAW_SOUL_FILE               M5CLAW_SPIFFS_BASE "/config/SOUL.md"
-#define M5CLAW_USER_FILE               M5CLAW_SPIFFS_BASE "/config/USER.md"
-#define M5CLAW_MEMORY_FILE             M5CLAW_SPIFFS_BASE "/memory/MEMORY.md"
-#define M5CLAW_SESSION_DIR             M5CLAW_SPIFFS_BASE "/sessions"
+// Memory / SPIFFS  (SPIFFS.open() auto-prepends mount point "/spiffs")
+#define M5CLAW_SOUL_FILE               "/config/SOUL.md"
+#define M5CLAW_USER_FILE               "/config/USER.md"
+#define M5CLAW_MEMORY_FILE             "/memory/MEMORY.md"
+#define M5CLAW_MEMORY_DIR              "/memory"
+#define M5CLAW_SESSION_DIR             "/sessions"
 #define M5CLAW_CONTEXT_BUF_SIZE        (4 * 1024)
 #define M5CLAW_SESSION_MAX_MSGS        10
+
+// Feishu Bot
+#define M5CLAW_FEISHU_TASK_STACK       (16 * 1024)
+#define M5CLAW_FEISHU_TASK_PRIO        5
+#define M5CLAW_FEISHU_TASK_CORE        0
+#define M5CLAW_FEISHU_MAX_MSG_LEN      2048
+#define M5CLAW_FEISHU_API_BASE         "open.feishu.cn"
+#define M5CLAW_FEISHU_DEDUP_SIZE       64
+
+// GLM Web Search (Zhipu AI)
+#define M5CLAW_SEARCH_HOST             "open.bigmodel.cn"
+#define M5CLAW_SEARCH_PATH             "/api/paas/v4/web_search"
+#define M5CLAW_SEARCH_ENGINE           "search_std"
+#define M5CLAW_SEARCH_BUF_SIZE         (4 * 1024)
+#define M5CLAW_SEARCH_MAX_RESULTS      3
+
+// Cron Service
+#define M5CLAW_CRON_FILE               "/cron.json"
+#define M5CLAW_CRON_MAX_JOBS           8
+#define M5CLAW_CRON_CHECK_MS           (60 * 1000)
+
+// Heartbeat
+#define M5CLAW_HEARTBEAT_FILE          "/HEARTBEAT.md"
+#define M5CLAW_HEARTBEAT_INTERVAL_MS   (30 * 60 * 1000)
+
+// Skills
+#define M5CLAW_SKILLS_PREFIX           "/skills/"
+
+// Message Bus
+#define M5CLAW_BUS_QUEUE_LEN           8
+
+// Channel identifiers
+#define M5CLAW_CHAN_LOCAL               "local"
+#define M5CLAW_CHAN_FEISHU              "feishu"
+#define M5CLAW_CHAN_SYSTEM              "system"
 
 // DashScope STT
 #define M5CLAW_STT_WS_HOST             "dashscope.aliyuncs.com"

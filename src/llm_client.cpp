@@ -34,13 +34,17 @@ static bool provider_is_minimax_compatible() {
 }
 
 static bool resolve_host(const char* host, IPAddress& ip, const char* tag) {
-    for (int attempt = 1; attempt <= 3; attempt++) {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.printf("%s WiFi not connected\n", tag);
+        return false;
+    }
+    for (int attempt = 1; attempt <= 2; attempt++) {
         if (WiFi.hostByName(host, ip)) {
             Serial.printf("%s DNS %s -> %s\n", tag, host, ip.toString().c_str());
             return true;
         }
-        Serial.printf("%s DNS failed (%d/3)\n", tag, attempt);
-        delay(200);
+        Serial.printf("%s DNS failed (%d/2)\n", tag, attempt);
+        delay(100);
     }
     return false;
 }
@@ -49,13 +53,13 @@ static bool secure_connect(WiFiClientSecure& client, const char* host, uint16_t 
     IPAddress ip;
     if (!resolve_host(host, ip, tag)) return false;
     client.setInsecure();
-    client.setTimeout(15000);
-    for (int attempt = 1; attempt <= 3; attempt++) {
+    client.setTimeout(10000);
+    for (int attempt = 1; attempt <= 2; attempt++) {
         if (client.connect(ip, port)) {
             return true;
         }
-        Serial.printf("%s connect failed (%d/3)\n", tag, attempt);
-        delay(300);
+        Serial.printf("%s connect failed (%d/2)\n", tag, attempt);
+        delay(200);
     }
     return false;
 }
@@ -355,7 +359,7 @@ bool llm_chat_tools(const char* system_prompt,
     client.print(bodyStr);
     bodyStr = "";
 
-    unsigned long deadline = millis() + 45000;
+    unsigned long deadline = millis() + 30000;
 
     if (!skip_http_headers(client, deadline)) {
         Serial.println("[LLM] Timeout reading headers");

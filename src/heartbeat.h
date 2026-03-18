@@ -1,0 +1,9 @@
+#pragma once
+#include <Arduino.h>
+
+namespace Heartbeat {
+    void init();
+    void start();
+    void stop();
+    bool trigger();
+}

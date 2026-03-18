@@ -14,6 +14,8 @@ public:
 
     void appendAIToken(const char* token);
     void onAIResponseComplete();
+    void addMessage(const String& text, bool isUser);
+    void scrollToBottom();
 
     bool hasPendingMessage() const { return pendingMessage.length() > 0; }
     String takePendingMessage();
@@ -53,8 +55,6 @@ private:
 
     void drawMessages(M5Canvas& canvas);
     void drawInputBar(M5Canvas& canvas);
-    void addMessage(const String& text, bool isUser);
-    void scrollToBottom();
     int calcMessageHeight(M5Canvas& canvas, const Message& msg);
     int calcTotalHeight(M5Canvas& canvas);
 };
