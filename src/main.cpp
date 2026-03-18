@@ -329,7 +329,8 @@ void loop() {
                 }
                 if (ks.fn && ks.word.size() > 0 && ks.word[0] == 'r') {
                     WiFi.disconnect(true);
-                    Config::reset();
+                    Config::setSSID("");
+                    Config::setPassword("");
                     Config::save();
                     enterSetupMode();
                     break;
@@ -341,23 +342,7 @@ void loop() {
                         break;
                     }
                 }
-                char key = 0;
-                if (ks.enter) key = '\n';
-                else if (ks.word.size() > 0) {
-                    char ch = ks.word[0];
-                    if (ch != ';' && ch != '.' && ch != ',' && ch != '/')
-                        key = ch;
-                }
-                if (key) companion.handleKey(key);
-            }
-
-            for (char ch : ks.word) {
-                switch (ch) {
-                    case ';': companion.move(0, -1); break;
-                    case '.': companion.move(0,  1); break;
-                    case ',': companion.move(-1, 0); break;
-                    case '/': companion.move( 1, 0); break;
-                }
+                Companion::playKeyClick();
             }
 
             if (!offlineMode) weatherClient.update();
@@ -700,13 +685,22 @@ void updateSetupMode() {
     }
 
     canvas.setTextColor(Color::STATUS_DIM);
-    canvas.drawString("[Enter] confirm  [Tab] skip/cancel", 10, 70);
-    if ((setupStep == SetupStep::SSID || setupStep == SetupStep::PASSWORD) && hasPreconfiguredOnlineSettings()) {
-        canvas.drawString("[default AI config loaded]", 10, 84);
+    bool wifiOnly = hasPreconfiguredOnlineSettings();
+    if (wifiOnly) {
+        canvas.drawString("[Enter] confirm  [Tab] skip", 10, 70);
+        canvas.drawString("AI config already set", 10, 84);
+    } else {
+        canvas.drawString("[Enter] confirm  [Tab] skip/cancel", 10, 70);
     }
 
-    int stepNum = (int)setupStep + 1;
-    int totalSteps = 7;
+    int stepNum, totalSteps;
+    if (wifiOnly) {
+        stepNum = (setupStep == SetupStep::SSID) ? 1 : 2;
+        totalSteps = 2;
+    } else {
+        stepNum = (int)setupStep + 1;
+        totalSteps = 7;
+    }
     char progress[16];
     snprintf(progress, sizeof(progress), "Step %d/%d", stepNum, totalSteps);
     canvas.drawString(progress, SCREEN_W - 60, 4);
@@ -825,7 +819,7 @@ void connectWiFi() {
         canvas.drawString("WiFi failed!", 80, 20);
         canvas.setTextColor(Color::CLOCK_TEXT);
         canvas.drawString("[Enter]  Retry", 60, 48);
-        canvas.drawString("[Fn+R]   Setup wizard", 60, 63);
+        canvas.drawString("[Fn+R]   Change WiFi", 60, 63);
         canvas.drawString("[Tab]    Offline mode", 60, 78);
         canvas.pushSprite(0, 0);
 
@@ -835,7 +829,8 @@ void connectWiFi() {
                 auto ks = M5Cardputer.Keyboard.keysState();
                 if (ks.enter) break;
                 if (ks.fn && ks.word.size() > 0 && ks.word[0] == 'r') {
-                    Config::reset();
+                    Config::setSSID("");
+                    Config::setPassword("");
                     Config::save();
                     enterSetupMode();
                     return;
