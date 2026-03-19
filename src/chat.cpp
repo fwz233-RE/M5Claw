@@ -51,9 +51,6 @@ void Chat::begin(M5Canvas& canvas) {
         inputBuffer = "";
         pendingMessage = "";
         waitingForAI = false;
-        for (int i = 0; i < MAX_MESSAGES; i++) {
-            messages[i].text.reserve(320);
-        }
         initialized = true;
     }
     canvas.setFont(&fonts::efontCN_12);
@@ -67,8 +64,6 @@ void Chat::update(M5Canvas& canvas) {
     canvas.setFont(&fonts::efontCN_12);
     canvas.setTextSize(1);
 
-    canvas.setTextColor(Color::STATUS_DIM);
-    canvas.drawString("[Tab/Ctrl]scroll [Alt]home [Fn]voice", 4, 2);
     canvas.drawFastHLine(0, MSG_AREA_Y - 1, SCREEN_W, Color::GROUND_TOP);
 
     drawMessages(canvas);
@@ -133,6 +128,17 @@ void Chat::onAIResponseComplete() {
     scrollToBottom();
 }
 
+void Chat::cancelWaiting() {
+    if (messageCount > 0) {
+        Message& lastMsg = messages[(messageCount - 1) % MAX_MESSAGES];
+        if (!lastMsg.isUser && lastMsg.text == "thinking...") {
+            lastMsg.text = "[cancelled]";
+            heightsDirty = true;
+        }
+    }
+    waitingForAI = false;
+    pendingMessage = "";
+}
 
 bool Chat::isAtBottom() const {
     int maxScroll = totalContentH - MSG_AREA_H;
@@ -152,15 +158,13 @@ void Chat::setInput(const String& text) {
 
 void Chat::addMessage(const String& text, bool isUser) {
     int idx = messageCount % MAX_MESSAGES;
+    messages[idx].text = "";
     messages[idx].isUser = isUser;
     cachedHeights[idx] = 0;
     if (!isUser) {
-        messages[idx].text = "";
-        messages[idx].text.reserve(320);
-        messages[idx].text = text;
-    } else {
-        messages[idx].text = text;
+        messages[idx].text.reserve(512);
     }
+    messages[idx].text = text;
     messageCount++;
     heightsDirty = true;
     if (!userScrolled) scrollToBottom();

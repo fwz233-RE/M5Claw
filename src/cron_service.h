@@ -22,7 +22,6 @@ struct CronJob {
 namespace CronService {
     void init();
     void start();
-    void stop();
     bool addJob(CronJob* job);
     bool removeJob(const char* jobId);
     void listJobs(const CronJob** jobs, int* count);

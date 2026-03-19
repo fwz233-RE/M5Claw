@@ -7,10 +7,12 @@ namespace FeishuBot {
     void stop();
     void resume();
     bool sendMessage(const char* chatId, const char* text);
-    bool replyMessage(const char* messageId, const char* text);
     bool isRunning();
-    bool isStopped();
 
     bool hasIncomingForDisplay();
     char* takeIncomingForDisplay();
+
+    bool addReaction(const char* messageId, const char* emojiType,
+                     char* reactionIdOut, size_t reactionIdSize);
+    bool removeReaction(const char* messageId, const char* reactionId);
 }

@@ -58,11 +58,3 @@ void Heartbeat::start() {
     }
 }
 
-void Heartbeat::stop() {
-    if (s_timer) { xTimerStop(s_timer, 0); xTimerDelete(s_timer, 0); s_timer = nullptr; }
-}
-
-bool Heartbeat::trigger() {
-    heartbeatCheck(nullptr);
-    return true;
-}

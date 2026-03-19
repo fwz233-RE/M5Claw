@@ -13,7 +13,6 @@
 /* ── Feishu API endpoints ──────────────────────────── */
 #define FS_AUTH_PATH    "/open-apis/auth/v3/tenant_access_token/internal"
 #define FS_SEND_PATH    "/open-apis/im/v1/messages"
-#define FS_REPLY_PATH   "/open-apis/im/v1/messages/%s/reply"
 #define FS_WS_CFG_URL   "https://open.feishu.cn/callback/ws/endpoint"
 
 /* ── State ─────────────────────────────────────────── */
@@ -33,9 +32,11 @@ static char s_ws_path[256]     = {0};
 static int s_service_id        = 0;
 static int s_ping_interval_ms  = 120000;
 
-/* ── Incoming message for UI display ────────────────── */
-static volatile bool s_incomingReady = false;
-static char* s_incomingText = nullptr;
+/* ── Incoming message display queue ─────────────────── */
+#define FEISHU_DISPLAY_QUEUE_SIZE 6
+static char* s_displayQueue[FEISHU_DISPLAY_QUEUE_SIZE] = {};
+static volatile int s_displayHead = 0;
+static volatile int s_displayTail = 0;
 
 /* ── Deduplication ─────────────────────────────────── */
 static uint64_t s_seen_keys[M5CLAW_FEISHU_DEDUP_SIZE] = {0};
@@ -349,15 +350,21 @@ static void handleMessageEvent(JsonObject event) {
     }
     if (strcmp(chatType, "p2p") == 0 && senderId[0]) routeId = senderId;
 
-    Serial.printf("[FEISHU] Msg from %s: %.60s\n", routeId, cleaned);
+    Serial.printf("[FEISHU] Msg from %s: %.200s\n", routeId, cleaned);
 
-    free(s_incomingText);
-    s_incomingText = strdup(cleaned);
-    s_incomingReady = true;
+    int next = (s_displayHead + 1) % FEISHU_DISPLAY_QUEUE_SIZE;
+    if (next == s_displayTail) {
+        free(s_displayQueue[s_displayTail]);
+        s_displayQueue[s_displayTail] = nullptr;
+        s_displayTail = (s_displayTail + 1) % FEISHU_DISPLAY_QUEUE_SIZE;
+    }
+    s_displayQueue[s_displayHead] = strdup(cleaned);
+    s_displayHead = next;
 
     BusMessage msg = {};
     strlcpy(msg.channel, M5CLAW_CHAN_FEISHU, sizeof(msg.channel));
     strlcpy(msg.chat_id, routeId, sizeof(msg.chat_id));
+    strlcpy(msg.msg_id, messageId, sizeof(msg.msg_id));
     msg.content = strdup(cleaned);
     if (msg.content) {
         if (!MessageBus::pushInbound(&msg)) free(msg.content);
@@ -634,8 +641,6 @@ void FeishuBot::start() {
 
 bool FeishuBot::isRunning() { return s_running && s_ws_connected; }
 
-bool FeishuBot::isStopped() { return s_stopped; }
-
 void FeishuBot::stop() {
     if (!s_running || s_stopped) return;
     s_stopRequested = true;
@@ -700,41 +705,116 @@ bool FeishuBot::sendMessage(const char* chatId, const char* text) {
     return allOk;
 }
 
-bool FeishuBot::replyMessage(const char* messageId, const char* text) {
-    if (!s_app_id[0] || !s_app_secret[0]) return false;
+bool FeishuBot::hasIncomingForDisplay() {
+    return s_displayHead != s_displayTail;
+}
+
+char* FeishuBot::takeIncomingForDisplay() {
+    if (s_displayHead == s_displayTail) return nullptr;
+    char* text = s_displayQueue[s_displayTail];
+    s_displayQueue[s_displayTail] = nullptr;
+    s_displayTail = (s_displayTail + 1) % FEISHU_DISPLAY_QUEUE_SIZE;
+    return text;
+}
+
+static String httpsDelete(const char* host, const char* path, const char* authHeader) {
+    if (WiFi.status() != WL_CONNECTED) return "";
+    WiFiClientSecure* client = new WiFiClientSecure();
+    if (!client) return "";
+    client->setInsecure();
+    client->setTimeout(30000);
+    IPAddress ip;
+    if (!resolveHost(host, ip)) { delete client; return ""; }
+    if (!client->connect(ip, 443)) { delete client; return ""; }
+    client->printf("DELETE %s HTTP/1.1\r\n", path);
+    client->printf("Host: %s\r\n", host);
+    if (authHeader && authHeader[0]) client->printf("Authorization: %s\r\n", authHeader);
+    client->println("Connection: close");
+    client->println();
+    int state = 0; bool headersDone = false;
+    while (client->connected()) {
+        if (!client->available()) { delay(1); continue; }
+        char c = client->read();
+        switch (state) {
+            case 0: state = (c == '\r') ? 1 : (c == '\n') ? 2 : 0; break;
+            case 1: state = (c == '\n') ? 2 : (c == '\r') ? 1 : 0; break;
+            case 2: if (c == '\n') headersDone = true; state = (c == '\r') ? 3 : 0; break;
+            case 3: if (c == '\n') headersDone = true; state = 0; break;
+        }
+        if (headersDone) break;
+    }
+    String resp; resp.reserve(512);
+    while (client->connected() || client->available()) {
+        if (client->available()) { char c = client->read(); if (resp.length() < 2048) resp += c; }
+        else delay(1);
+    }
+    client->stop(); delete client;
+    return resp;
+}
+
+static String feishuApiDelete(const char* path) {
+    if (!refreshToken()) return "";
+    char auth[600];
+    snprintf(auth, sizeof(auth), "Bearer %s", s_tenant_token);
+    return httpsDelete(M5CLAW_FEISHU_API_BASE, path, auth);
+}
+
+bool FeishuBot::addReaction(const char* messageId, const char* emojiType,
+                            char* reactionIdOut, size_t reactionIdSize) {
+    if (!messageId || !messageId[0]) return false;
+    if (reactionIdOut) reactionIdOut[0] = '\0';
+
+    const char* emoji = (emojiType && emojiType[0]) ? emojiType : "Typing";
 
     char path[256];
-    snprintf(path, sizeof(path), "/open-apis/im/v1/messages/%s/reply", messageId);
-
-    JsonDocument contentDoc;
-    contentDoc["text"] = text;
-    String contentStr;
-    serializeJson(contentDoc, contentStr);
+    snprintf(path, sizeof(path), "/open-apis/im/v1/messages/%s/reactions", messageId);
 
     JsonDocument bodyDoc;
-    bodyDoc["msg_type"] = "text";
-    bodyDoc["content"] = contentStr;
+    bodyDoc["reaction_type"]["emoji_type"] = emoji;
     String bodyStr;
     serializeJson(bodyDoc, bodyStr);
 
     String resp = feishuApiCall(path, bodyStr.c_str());
-    if (resp.length() > 0) {
-        int jsonStart = resp.indexOf('{');
-        if (jsonStart >= 0) {
-            JsonDocument rdoc;
-            if (!deserializeJson(rdoc, resp.c_str() + jsonStart)) {
-                return (rdoc["code"] | -1) == 0;
-            }
-        }
+    if (resp.length() == 0) return false;
+
+    int jsonStart = resp.indexOf('{');
+    if (jsonStart < 0) return false;
+
+    JsonDocument rdoc;
+    if (deserializeJson(rdoc, resp.c_str() + jsonStart)) return false;
+    int code = rdoc["code"] | -1;
+    if (code != 0) {
+        Serial.printf("[FEISHU] addReaction error code=%d\n", code);
+        return false;
     }
-    return false;
+
+    const char* rid = rdoc["data"]["reaction_id"] | "";
+    if (rid[0] && reactionIdOut) {
+        strlcpy(reactionIdOut, rid, reactionIdSize);
+    }
+    Serial.printf("[FEISHU] Reaction added: %s -> %s\n", emoji, rid);
+    return true;
 }
 
-bool FeishuBot::hasIncomingForDisplay() { return s_incomingReady; }
+bool FeishuBot::removeReaction(const char* messageId, const char* reactionId) {
+    if (!messageId || !messageId[0] || !reactionId || !reactionId[0]) return false;
 
-char* FeishuBot::takeIncomingForDisplay() {
-    char* text = s_incomingText;
-    s_incomingText = nullptr;
-    s_incomingReady = false;
-    return text;
+    char path[384];
+    snprintf(path, sizeof(path), "/open-apis/im/v1/messages/%s/reactions/%s", messageId, reactionId);
+
+    String resp = feishuApiDelete(path);
+    if (resp.length() == 0) return false;
+
+    int jsonStart = resp.indexOf('{');
+    if (jsonStart < 0) return false;
+
+    JsonDocument rdoc;
+    if (deserializeJson(rdoc, resp.c_str() + jsonStart)) return false;
+    int code = rdoc["code"] | -1;
+    if (code != 0) {
+        Serial.printf("[FEISHU] removeReaction error code=%d\n", code);
+        return false;
+    }
+    Serial.println("[FEISHU] Reaction removed");
+    return true;
 }

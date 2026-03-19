@@ -4,14 +4,14 @@
 #define M5CLAW_AGENT_STACK             (10 * 1024)
 #define M5CLAW_AGENT_PRIO              6
 #define M5CLAW_AGENT_CORE              1
-#define M5CLAW_AGENT_MAX_HISTORY       10
+#define M5CLAW_AGENT_MAX_HISTORY       6
 #define M5CLAW_AGENT_MAX_TOOL_ITER     10
 #define M5CLAW_MAX_TOOL_CALLS          4
 
 // LLM
-#define M5CLAW_LLM_DEFAULT_MODEL       "claude-sonnet-4-20250514"
+#define M5CLAW_LLM_DEFAULT_MODEL       "claude-sonnet-4.6"
 #define M5CLAW_LLM_PROVIDER_DEFAULT    "anthropic"
-#define M5CLAW_LLM_MAX_TOKENS          2048
+#define M5CLAW_LLM_MAX_TOKENS          4096
 #define M5CLAW_LLM_ANTHROPIC_URL       "api.anthropic.com"
 #define M5CLAW_LLM_ANTHROPIC_PATH      "/v1/messages"
 #define M5CLAW_LLM_OPENAI_URL          "api.openai.com"
@@ -40,8 +40,7 @@
 #define M5CLAW_SEARCH_HOST             "open.bigmodel.cn"
 #define M5CLAW_SEARCH_PATH             "/api/paas/v4/web_search"
 #define M5CLAW_SEARCH_ENGINE           "search_std"
-#define M5CLAW_SEARCH_BUF_SIZE         (4 * 1024)
-#define M5CLAW_SEARCH_MAX_RESULTS      3
+#define M5CLAW_SEARCH_MAX_RESULTS      25
 
 // Cron Service
 #define M5CLAW_CRON_FILE               "/cron.json"
@@ -72,16 +71,6 @@
 #define M5CLAW_STT_CHUNK_MS            100
 #define M5CLAW_STT_MAX_SECONDS         120
 
-// DashScope TTS
-#define M5CLAW_TTS_HOST                "dashscope.aliyuncs.com"
-#define M5CLAW_TTS_PATH                "/api/v1/services/aigc/multimodal-generation/generation"
-#define M5CLAW_TTS_MODEL               "qwen3-tts-flash"
-#define M5CLAW_TTS_VOICE               "Cherry"
-#define M5CLAW_TTS_SAMPLE_RATE         24000
-
-// Voice buffer (shared between mic recording and TTS playback)
-#define M5CLAW_VOICE_BUF_SECONDS       10
-#define M5CLAW_VOICE_BUF_SAMPLES       (M5CLAW_TTS_SAMPLE_RATE * M5CLAW_VOICE_BUF_SECONDS)
 
 // NTP
 #define M5CLAW_NTP_SERVER              "pool.ntp.org"

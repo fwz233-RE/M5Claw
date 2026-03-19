@@ -4,7 +4,7 @@
 static Preferences prefs;
 static String ssid, password, ssid2, password2, city;
 static String llmApiKey, llmModel, llmProvider, llmHost, llmPath;
-static String dashScopeKey, searchKey, glmSearchKey;
+static String dashScopeKey, glmSearchKey;
 static String feishuAppId, feishuAppSecret;
 
 bool Config::load() {
@@ -20,7 +20,6 @@ bool Config::load() {
     llmHost         = prefs.getString("llm_host", "");
     llmPath         = prefs.getString("llm_path", "");
     dashScopeKey    = prefs.getString("ds_key", "");
-    searchKey       = prefs.getString("srch_key", "");
     glmSearchKey    = prefs.getString("glm_key", "");
     feishuAppId     = prefs.getString("fs_appid", "");
     feishuAppSecret = prefs.getString("fs_secret", "");
@@ -41,7 +40,6 @@ void Config::save() {
     prefs.putString("llm_host",  llmHost);
     prefs.putString("llm_path",  llmPath);
     prefs.putString("ds_key",    dashScopeKey);
-    prefs.putString("srch_key",  searchKey);
     prefs.putString("glm_key",   glmSearchKey);
     prefs.putString("fs_appid",  feishuAppId);
     prefs.putString("fs_secret", feishuAppSecret);
@@ -54,7 +52,7 @@ void Config::reset() {
     prefs.end();
     ssid = password = ssid2 = password2 = city = "";
     llmApiKey = llmModel = llmProvider = llmHost = llmPath = "";
-    dashScopeKey = searchKey = glmSearchKey = "";
+    dashScopeKey = glmSearchKey = "";
     feishuAppId = feishuAppSecret = "";
 }
 
@@ -69,7 +67,6 @@ const String& Config::getLlmProvider()     { return llmProvider; }
 const String& Config::getLlmHost()         { return llmHost; }
 const String& Config::getLlmPath()         { return llmPath; }
 const String& Config::getDashScopeKey()    { return dashScopeKey; }
-const String& Config::getSearchKey()       { return searchKey; }
 const String& Config::getGlmSearchKey()    { return glmSearchKey; }
 const String& Config::getFeishuAppId()     { return feishuAppId; }
 const String& Config::getFeishuAppSecret() { return feishuAppSecret; }
@@ -85,7 +82,6 @@ void Config::setLlmProvider(const String& p)     { llmProvider = p; }
 void Config::setLlmHost(const String& h)         { llmHost = h; }
 void Config::setLlmPath(const String& p)         { llmPath = p; }
 void Config::setDashScopeKey(const String& k)    { dashScopeKey = k; }
-void Config::setSearchKey(const String& k)       { searchKey = k; }
 void Config::setGlmSearchKey(const String& k)    { glmSearchKey = k; }
 void Config::setFeishuAppId(const String& id)    { feishuAppId = id; }
 void Config::setFeishuAppSecret(const String& s) { feishuAppSecret = s; }

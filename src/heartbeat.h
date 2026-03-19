@@ -4,6 +4,4 @@
 namespace Heartbeat {
     void init();
     void start();
-    void stop();
-    bool trigger();
 }

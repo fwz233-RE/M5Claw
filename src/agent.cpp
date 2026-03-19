@@ -16,6 +16,7 @@ struct AgentRequest {
     char* text;
     char channel[16];
     char chatId[96];
+    char msgId[64];
     AgentResponseCallback callback;
     AgentResponseExCallback exCallback;
 };
@@ -23,13 +24,45 @@ struct AgentRequest {
 static QueueHandle_t s_queue = nullptr;
 static volatile bool s_busy = false;
 static volatile bool s_ready = false;
+static volatile bool s_abortRequested = false;
 
 static volatile bool s_extConvReady = false;
 static char* s_extConvUser = nullptr;
 static char* s_extConvAI = nullptr;
 static char s_extConvChannel[16] = {0};
 
-#define TOOL_OUTPUT_SIZE (2 * 1024)
+static JsonDocument** s_freeable_messages = nullptr;
+
+static void preReadFree() {
+    if (s_freeable_messages && *s_freeable_messages) {
+        JsonDocument* doc = *s_freeable_messages;
+        doc->~JsonDocument();
+        heap_caps_free(doc);
+        *s_freeable_messages = nullptr;
+        Serial.printf("[AGENT] Freed messages for LLM buffer, heap=%d\n", ESP.getFreeHeap());
+    }
+}
+
+static char* stripMarkdownBold(const char* text) {
+    if (!text) return nullptr;
+    size_t len = strlen(text);
+    char* out = (char*)malloc(len + 1);
+    if (!out) return nullptr;
+    size_t j = 0;
+    for (size_t i = 0; i < len; ) {
+        if (i + 1 < len && text[i] == '*' && text[i + 1] == '*') {
+            i += 2;
+        } else if (text[i] == '#') {
+            i++;
+        } else {
+            out[j++] = text[i++];
+        }
+    }
+    out[j] = '\0';
+    return out;
+}
+
+#define TOOL_OUTPUT_SIZE (6 * 1024)
 
 static void* alloc_prefer_psram(size_t size) {
     void* p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -44,7 +77,21 @@ static void* calloc_prefer_psram(size_t count, size_t size) {
 }
 
 static void processRequest(AgentRequest& req, char* system_prompt, char* tool_output) {
-    Serial.printf("[AGENT] Processing (ch=%s): %.60s\n", req.channel, req.text);
+    Serial.printf("[AGENT] Processing (ch=%s): %.200s\n", req.channel, req.text);
+
+    if (s_abortRequested) {
+        Serial.println("[AGENT] Aborted before processing");
+        if (req.callback) req.callback("[cancelled]");
+        if (strcmp(req.channel, M5CLAW_CHAN_LOCAL) != 0) {
+            free(s_extConvUser);
+            free(s_extConvAI);
+            s_extConvUser = strdup(req.text);
+            s_extConvAI = strdup("[cancelled]");
+            strlcpy(s_extConvChannel, req.channel, sizeof(s_extConvChannel));
+            s_extConvReady = true;
+        }
+        return;
+    }
 
     ContextBuilder::buildSystemPrompt(system_prompt, M5CLAW_CONTEXT_BUF_SIZE);
 
@@ -63,6 +110,7 @@ static void processRequest(AgentRequest& req, char* system_prompt, char* tool_ou
     }
 
     deserializeJson(*messages, histJson);
+    histJson = "";
 
     JsonObject userMsg = messages->as<JsonArray>().add<JsonObject>();
     userMsg["role"] = "user";
@@ -71,13 +119,71 @@ static void processRequest(AgentRequest& req, char* system_prompt, char* tool_ou
     const char* tools_json = ToolRegistry::getToolsJson();
     char* final_text = nullptr;
     int iteration = 0;
+    int retryCount = 0;
 
     while (iteration < M5CLAW_AGENT_MAX_TOOL_ITER) {
+        if (s_abortRequested) {
+            Serial.println("[AGENT] Aborted before LLM call");
+            break;
+        }
+
         LlmResponse resp;
-        bool ok = llm_chat_tools(system_prompt, *messages, tools_json, &resp);
+        memset(&resp, 0, sizeof(resp));
+        bool ok = false;
+
+        for (;;) {
+            if (s_abortRequested) break;
+
+            if (retryCount > 0) {
+                char retryMsg[64];
+                snprintf(retryMsg, sizeof(retryMsg),
+                         "\xe9\x87\x8d\xe8\xaf\x95\xe4\xb8\xad... (%d/10)", retryCount);
+                Serial.printf("[AGENT] %s\n", retryMsg);
+                if (req.callback) req.callback(retryMsg);
+                if (strcmp(req.channel, M5CLAW_CHAN_FEISHU) == 0 && req.chatId[0]) {
+                    FeishuBot::sendMessage(req.chatId, retryMsg);
+                }
+                delay(2000);
+            }
+
+            if (messages == nullptr) {
+                void* newMem = alloc_prefer_psram(sizeof(JsonDocument));
+                messages = newMem ? new (newMem) JsonDocument : nullptr;
+                if (!messages) {
+                    Serial.println("[AGENT] OOM reconstructing messages for retry");
+                    break;
+                }
+                String freshHist = SessionMgr::getHistoryJson(sessionId, M5CLAW_AGENT_MAX_HISTORY);
+                deserializeJson(*messages, freshHist);
+                JsonObject rebuiltUser = messages->as<JsonArray>().add<JsonObject>();
+                rebuiltUser["role"] = "user";
+                rebuiltUser["content"] = req.text;
+            }
+
+            s_freeable_messages = &messages;
+            llm_client_set_pre_read_free(preReadFree);
+            ok = llm_chat_tools(system_prompt, *messages, tools_json, &resp);
+            llm_client_set_pre_read_free(nullptr);
+            s_freeable_messages = nullptr;
+
+            if (ok || s_abortRequested) break;
+
+            retryCount++;
+            Serial.printf("[AGENT] LLM failed, retry %d/10\n", retryCount);
+            llm_response_free(&resp);
+            memset(&resp, 0, sizeof(resp));
+
+            if (retryCount >= 10) break;
+        }
+
+        if (s_abortRequested) {
+            llm_response_free(&resp);
+            Serial.println("[AGENT] Aborted");
+            break;
+        }
 
         if (!ok) {
-            Serial.println("[AGENT] LLM call failed");
+            Serial.println("[AGENT] LLM failed after all retries");
             break;
         }
 
@@ -90,6 +196,21 @@ static void processRequest(AgentRequest& req, char* system_prompt, char* tool_ou
         }
 
         Serial.printf("[AGENT] Tool iteration %d: %d calls\n", iteration + 1, resp.call_count);
+
+        if (messages == nullptr) {
+            void* newMem = alloc_prefer_psram(sizeof(JsonDocument));
+            messages = newMem ? new (newMem) JsonDocument : nullptr;
+            if (!messages) {
+                Serial.println("[AGENT] OOM reconstructing messages for tool iteration");
+                llm_response_free(&resp);
+                break;
+            }
+            String freshHist = SessionMgr::getHistoryJson(sessionId, M5CLAW_AGENT_MAX_HISTORY);
+            deserializeJson(*messages, freshHist);
+            JsonObject rebuiltUser = messages->as<JsonArray>().add<JsonObject>();
+            rebuiltUser["role"] = "user";
+            rebuiltUser["content"] = req.text;
+        }
 
         JsonObject asstMsg = messages->as<JsonArray>().add<JsonObject>();
         asstMsg["role"] = "assistant";
@@ -128,11 +249,22 @@ static void processRequest(AgentRequest& req, char* system_prompt, char* tool_ou
         resultMsg["role"] = "user";
         JsonArray resultContent = resultMsg["content"].to<JsonArray>();
 
+        bool searchDone = false;
         for (int i = 0; i < resp.call_count; i++) {
             tool_output[0] = '\0';
-            ToolRegistry::execute(resp.calls[i].name,
-                                  resp.calls[i].input ? resp.calls[i].input : "{}",
-                                  tool_output, TOOL_OUTPUT_SIZE);
+            bool isSearch = strcmp(resp.calls[i].name, "web_search") == 0;
+            if (isSearch && searchDone) {
+                strlcpy(tool_output,
+                        "\xe8\xaf\xb7\xe9\x80\x90\xe4\xb8\xaa\xe6\x90\x9c\xe7\xb4\xa2\xef\xbc\x8c"
+                        "\xe6\xaf\x8f\xe6\xac\xa1\xe5\x8f\xaa\xe6\x90\x9c\xe7\xb4\xa2\xe4\xb8\x80"
+                        "\xe4\xb8\xaa\xe4\xb8\xbb\xe9\xa2\x98\xe3\x80\x82",
+                        TOOL_OUTPUT_SIZE);
+            } else {
+                ToolRegistry::execute(resp.calls[i].name,
+                                      resp.calls[i].input ? resp.calls[i].input : "{}",
+                                      tool_output, TOOL_OUTPUT_SIZE);
+                if (isSearch) searchDone = true;
+            }
             JsonObject tr = resultContent.add<JsonObject>();
             tr["type"] = "tool_result";
             tr["tool_use_id"] = resp.calls[i].id;
@@ -143,18 +275,28 @@ static void processRequest(AgentRequest& req, char* system_prompt, char* tool_ou
         iteration++;
     }
 
-    messages->~JsonDocument();
-    heap_caps_free(messages);
+    if (messages) {
+        messages->~JsonDocument();
+        heap_caps_free(messages);
+    }
 
-    const char* responseText = (final_text && final_text[0]) ? final_text : "Sorry, an error occurred.";
+    bool wasAborted = s_abortRequested;
+    if (wasAborted) {
+        free(final_text);
+        final_text = strdup("[cancelled]");
+        Serial.println("[AGENT] Request was aborted");
+    }
 
-    if (final_text && final_text[0]) {
+    const char* responseText = (final_text && final_text[0]) ? final_text : "\xe8\xaf\xb7\xe6\xb1\x82\xe5\xa4\xb1\xe8\xb4\xa5\xef\xbc\x8c\xe8\xaf\xb7\xe9\x87\x8d\xe8\xaf\x95\xe3\x80\x82";
+
+    if (!wasAborted && final_text && final_text[0]) {
         SessionMgr::appendMessage(sessionId, "user", req.text);
         SessionMgr::appendMessage(sessionId, "assistant", final_text);
     }
 
     if (req.callback) req.callback(responseText);
-    if (req.exCallback) {
+
+    if (!wasAborted && req.exCallback) {
         AgentResponseInfo info = {responseText, req.channel, req.chatId};
         req.exCallback(&info);
     }
@@ -163,7 +305,7 @@ static void processRequest(AgentRequest& req, char* system_prompt, char* tool_ou
         free(s_extConvUser);
         free(s_extConvAI);
         s_extConvUser = strdup(req.text);
-        s_extConvAI = strdup(responseText);
+        s_extConvAI = wasAborted ? strdup("[cancelled]") : strdup(responseText);
         strlcpy(s_extConvChannel, req.channel, sizeof(s_extConvChannel));
         s_extConvReady = true;
     }
@@ -175,7 +317,9 @@ static void busResponseHandler(const AgentResponseInfo* info) {
     if (strcmp(info->channel, M5CLAW_CHAN_LOCAL) == 0) return;
 
     if (strcmp(info->channel, M5CLAW_CHAN_FEISHU) == 0) {
-        FeishuBot::sendMessage(info->chatId, info->text);
+        char* cleaned = stripMarkdownBold(info->text);
+        FeishuBot::sendMessage(info->chatId, cleaned ? cleaned : info->text);
+        free(cleaned);
         return;
     }
 
@@ -202,6 +346,7 @@ static void agent_task(void* arg) {
         return;
     }
 
+    llm_client_set_abort_flag(&s_abortRequested);
     s_ready = true;
     Serial.printf("[AGENT] Ready. Free heap=%d psram=%d stackHW=%u\n",
                   ESP.getFreeHeap(),
@@ -223,17 +368,17 @@ static void agent_task(void* arg) {
                 req.text = busMsg.content;
                 strlcpy(req.channel, busMsg.channel, sizeof(req.channel));
                 strlcpy(req.chatId, busMsg.chat_id, sizeof(req.chatId));
+                strlcpy(req.msgId, busMsg.msg_id, sizeof(req.msgId));
                 req.callback = nullptr;
-                req.exCallback = nullptr;
-                hasReq = true;
-
                 req.exCallback = busResponseHandler;
+                hasReq = true;
             }
         }
 
         if (!hasReq) continue;
 
         s_busy = true;
+        s_abortRequested = false;
 
         bool feishuWasActive = FeishuBot::isRunning();
         if (feishuWasActive) {
@@ -241,7 +386,18 @@ static void agent_task(void* arg) {
             Serial.printf("[AGENT] Feishu paused, heap=%d\n", ESP.getFreeHeap());
         }
 
+        char reactionId[128] = {0};
+        bool isFeishu = strcmp(req.channel, M5CLAW_CHAN_FEISHU) == 0;
+        if (isFeishu && req.msgId[0]) {
+            FeishuBot::addReaction(req.msgId, nullptr, reactionId, sizeof(reactionId));
+        }
+
         processRequest(req, system_prompt, tool_output);
+
+        if (isFeishu && reactionId[0] && req.msgId[0]) {
+            FeishuBot::removeReaction(req.msgId, reactionId);
+        }
+
         free(req.text);
 
         if (feishuWasActive) {
@@ -285,33 +441,8 @@ void Agent::sendMessage(const char* text, AgentResponseCallback onResponse) {
     }
 }
 
-void Agent::sendMessageEx(const char* text, const char* channel, const char* chatId,
-                          AgentResponseExCallback onResponse) {
-    if (!s_ready) {
-        if (onResponse) {
-            AgentResponseInfo info = {"Agent unavailable.", channel, chatId};
-            onResponse(&info);
-        }
-        return;
-    }
-    AgentRequest req;
-    memset(&req, 0, sizeof(req));
-    req.text = strdup(text);
-    strlcpy(req.channel, channel, sizeof(req.channel));
-    strlcpy(req.chatId, chatId, sizeof(req.chatId));
-    req.callback = nullptr;
-    req.exCallback = onResponse;
-    if (!req.text || xQueueSend(s_queue, &req, 0) != pdTRUE) {
-        free(req.text);
-        if (onResponse) {
-            AgentResponseInfo info = {"Agent queue full.", channel, chatId};
-            onResponse(&info);
-        }
-    }
-}
-
 bool Agent::isBusy() { return s_busy; }
-bool Agent::isReady() { return s_ready; }
+void Agent::requestAbort() { s_abortRequested = true; }
 
 bool Agent::hasExternalConv() { return s_extConvReady; }
 

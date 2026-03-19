@@ -10,6 +10,14 @@ static char s_provider[16] = M5CLAW_LLM_PROVIDER_DEFAULT;
 static char s_custom_host[128] = {0};
 static char s_custom_path[128] = {0};
 
+static volatile bool* s_abort_flag = nullptr;
+static bool is_aborted() { return s_abort_flag && *s_abort_flag; }
+
+static LlmPreReadFreeFn s_pre_read_free_fn = nullptr;
+
+void llm_client_set_abort_flag(volatile bool* flag) { s_abort_flag = flag; }
+void llm_client_set_pre_read_free(LlmPreReadFreeFn fn) { s_pre_read_free_fn = fn; }
+
 static void safe_copy(char* dst, size_t sz, const char* src) {
     if (!dst || !sz) return;
     if (!src) { dst[0] = '\0'; return; }
@@ -53,7 +61,7 @@ static bool secure_connect(WiFiClientSecure& client, const char* host, uint16_t 
     IPAddress ip;
     if (!resolve_host(host, ip, tag)) return false;
     client.setInsecure();
-    client.setTimeout(10000);
+    client.setTimeout(30000);
     for (int attempt = 1; attempt <= 2; attempt++) {
         if (client.connect(ip, port)) {
             return true;
@@ -101,10 +109,11 @@ void llm_response_free(LlmResponse* resp) {
     resp->tool_use = false;
 }
 
-static bool skip_http_headers(WiFiClientSecure& client, unsigned long deadline) {
+static bool skip_http_headers(WiFiClientSecure& client) {
     int state = 0;
-    while (client.connected() && millis() < deadline) {
-        if (!client.available()) { delay(1); continue; }
+    while (client.connected()) {
+        if (is_aborted()) return false;
+        if (!client.available()) { delay(10); continue; }
         char c = client.read();
         switch (state) {
             case 0: state = (c == '\r') ? 1 : (c == '\n') ? 2 : 0; break;
@@ -116,9 +125,10 @@ static bool skip_http_headers(WiFiClientSecure& client, unsigned long deadline) 
     return false;
 }
 
-static int read_http_body(WiFiClientSecure& client, char* buf, int bufSize, unsigned long deadline) {
+static int read_http_body(WiFiClientSecure& client, char* buf, int bufSize) {
     int len = 0;
-    while (len < bufSize - 1 && millis() < deadline) {
+    while (len < bufSize - 1) {
+        if (is_aborted()) break;
         if (client.available()) {
             buf[len++] = client.read();
         } else if (!client.connected()) {
@@ -217,7 +227,7 @@ static void build_openai_body(JsonDocument& doc, const char* system_prompt,
     }
 }
 
-static void parse_anthropic_response(const char* json, size_t len, LlmResponse* resp) {
+static void parse_anthropic_response(char* json, size_t len, LlmResponse* resp) {
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, json, len);
     if (err) {
@@ -273,7 +283,7 @@ static void parse_anthropic_response(const char* json, size_t len, LlmResponse* 
     }
 }
 
-static void parse_openai_response(const char* json, size_t len, LlmResponse* resp) {
+static void parse_openai_response(char* json, size_t len, LlmResponse* resp) {
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, json, len);
     if (err) {
@@ -359,25 +369,44 @@ bool llm_chat_tools(const char* system_prompt,
     client.print(bodyStr);
     bodyStr = "";
 
-    unsigned long deadline = millis() + 30000;
+    if (s_pre_read_free_fn) {
+        s_pre_read_free_fn();
+    }
 
-    if (!skip_http_headers(client, deadline)) {
-        Serial.println("[LLM] Timeout reading headers");
+    if (is_aborted()) {
+        Serial.println("[LLM] Aborted before reading response");
         client.stop();
         return false;
     }
 
-    char* respBuf = (char*)calloc_prefer_psram(1, M5CLAW_LLM_RESPONSE_BUF);
+    if (!skip_http_headers(client)) {
+        Serial.println("[LLM] Disconnected or aborted waiting for response");
+        client.stop();
+        return false;
+    }
+
+    const size_t HEAP_RESERVE = 16 * 1024;
+    size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    size_t bufSize = (largest > HEAP_RESERVE) ? largest - HEAP_RESERVE : 0;
+    if (bufSize > 64 * 1024) bufSize = 64 * 1024;
+
+    char* respBuf = nullptr;
+    if (bufSize >= 8 * 1024) {
+        respBuf = (char*)heap_caps_malloc(bufSize, MALLOC_CAP_8BIT);
+    }
+    if (!respBuf) { bufSize = 32 * 1024; respBuf = (char*)heap_caps_malloc(bufSize, MALLOC_CAP_8BIT); }
+    if (!respBuf) { bufSize = 16 * 1024; respBuf = (char*)heap_caps_malloc(bufSize, MALLOC_CAP_8BIT); }
+    if (!respBuf) { bufSize =  8 * 1024; respBuf = (char*)heap_caps_malloc(bufSize, MALLOC_CAP_8BIT); }
     if (!respBuf) {
-        Serial.printf("[LLM] Failed to allocate %d-byte response buffer, free heap=%d largest=%d\n",
-                      (int)M5CLAW_LLM_RESPONSE_BUF,
-                      ESP.getFreeHeap(),
-                      heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+        Serial.printf("[LLM] OOM for response buffer, heap=%d largest=%d\n",
+                      ESP.getFreeHeap(), (int)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
         client.stop();
         return false;
     }
+    respBuf[0] = '\0';
+    Serial.printf("[LLM] Response buffer: %dKB (heap=%d)\n", (int)(bufSize / 1024), ESP.getFreeHeap());
 
-    int respLen = read_http_body(client, respBuf, M5CLAW_LLM_RESPONSE_BUF, deadline);
+    int respLen = read_http_body(client, respBuf, (int)bufSize);
     client.stop();
     decode_chunked_in_place(respBuf, &respLen);
 
@@ -386,6 +415,16 @@ bool llm_chat_tools(const char* system_prompt,
     if (respLen == 0) {
         heap_caps_free(respBuf);
         return false;
+    }
+
+    if (respLen + 1024 < (int)bufSize) {
+        char* compact = (char*)malloc(respLen + 1);
+        if (compact) {
+            memcpy(compact, respBuf, respLen + 1);
+            heap_caps_free(respBuf);
+            respBuf = compact;
+            bufSize = respLen + 1;
+        }
     }
 
     if (provider_is_openai()) {
@@ -398,7 +437,7 @@ bool llm_chat_tools(const char* system_prompt,
         Serial.printf("[LLM] Empty/unknown response: %.300s\n", respBuf);
     }
 
-    heap_caps_free(respBuf);
+    free(respBuf);
 
     Serial.printf("[LLM] %d text bytes, %d tool calls, tool_use=%d\n",
                   (int)resp->text_len, resp->call_count, resp->tool_use);

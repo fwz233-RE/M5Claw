@@ -23,7 +23,6 @@ namespace Config {
     const String& getDashScopeKey();
 
     // Search
-    const String& getSearchKey();
     const String& getGlmSearchKey();
 
     // Feishu
@@ -41,7 +40,6 @@ namespace Config {
     void setLlmHost(const String& host);
     void setLlmPath(const String& path);
     void setDashScopeKey(const String& key);
-    void setSearchKey(const String& key);
     void setGlmSearchKey(const String& key);
     void setFeishuAppId(const String& id);
     void setFeishuAppSecret(const String& secret);

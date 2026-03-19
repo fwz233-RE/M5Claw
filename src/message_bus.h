@@ -5,6 +5,7 @@
 struct BusMessage {
     char channel[16];
     char chat_id[96];
+    char msg_id[64];
     char* content;   // heap-allocated, receiver must free()
 };
 

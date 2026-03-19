@@ -24,6 +24,11 @@ void llm_response_free(LlmResponse* resp);
 void llm_client_init(const char* api_key, const char* model, const char* provider,
                      const char* custom_host = nullptr, const char* custom_path = nullptr);
 
+void llm_client_set_abort_flag(volatile bool* flag);
+
+typedef void (*LlmPreReadFreeFn)();
+void llm_client_set_pre_read_free(LlmPreReadFreeFn fn);
+
 bool llm_chat_tools(const char* system_prompt,
                     JsonDocument& messages,
                     const char* tools_json,

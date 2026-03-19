@@ -21,11 +21,10 @@ public:
     String takePendingMessage();
 
     void setInput(const String& text);
-    const String& getInput() const { return inputBuffer; }
-
-    int getMessageCount() const { return messageCount; }
+    void cancelWaiting();
 
     bool isAtBottom() const;
+    bool isWaitingForAI() const { return waitingForAI; }
 
 private:
     static constexpr int MAX_MESSAGES = 20;

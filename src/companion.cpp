@@ -41,8 +41,8 @@ void Companion::update(M5Canvas& canvas) {
     if (walkTimer.tick()) walkFrame++;
 
     drawBackground(canvas);
-    drawWeatherEffects(canvas);
     drawCharacter(canvas);
+    drawWeatherEffects(canvas);
     drawTopBar(canvas);
     drawSimStatusBar(canvas);
 }

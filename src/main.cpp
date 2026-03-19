@@ -15,7 +15,6 @@
 #include "session_mgr.h"
 #include "context_builder.h"
 #include "dashscope_stt.h"
-#include "dashscope_tts.h"
 #include "message_bus.h"
 #include "feishu_bot.h"
 #include "cron_service.h"
@@ -77,16 +76,12 @@ enum class SetupStep {
 static SetupStep setupStep = SetupStep::SSID;
 static String setupInput;
 
-static int16_t* voiceBuffer = nullptr;
-static size_t voiceBufferSamples = 0;
 static bool voiceRecording = false;
-static size_t recordedSamples = 0;
 static unsigned long recordingStartMs = 0;
-static bool ttsPlaying = false;
-static size_t ttsSamples = 0;
 
 static const size_t STT_CHUNK_SAMPLES = 1600;
 static int16_t* sttChunkBuf = nullptr;
+static bool s_feishuPausedForVoice = false;
 
 void enterSetupMode();
 void updateSetupMode();
@@ -96,8 +91,6 @@ void connectWiFi();
 void initOnlineServices();
 void enterCompanionMode();
 void enterChatMode();
-void initVoiceBuffer();
-void releaseVoiceBuffer();
 void startVoiceRecording();
 String stopVoiceRecording();
 void streamVoiceData();
@@ -108,6 +101,8 @@ void dispatchOutbound();
 static void onAgentResponse(const char* text);
 static volatile bool agentResponseReady = false;
 static char* agentResponseText = nullptr;
+static bool s_discardAgentResponse = false;
+static bool s_waitingForFeishuResponse = false;
 
 static bool hasPreconfiguredOnlineSettings() {
     bool hasLlm = Config::getLlmApiKey().length() > 0
@@ -273,8 +268,6 @@ void setup() {
     canvas.pushSprite(0, 0);
     Serial.println("[BOOT] Display OK");
 
-    M5Cardputer.Speaker.setVolume(255);
-
     Config::load();
     fillBuildTimeDefaults();
     Config::save();
@@ -306,55 +299,34 @@ void setup() {
 void loop() {
     M5Cardputer.update();
 
-    // Feishu incoming → immediately show on chat UI + "thinking..."
-    if (FeishuBot::hasIncomingForDisplay()) {
+    // Feishu incoming → show one at a time, queue the rest
+    if (FeishuBot::hasIncomingForDisplay() && !s_waitingForFeishuResponse) {
         char* incoming = FeishuBot::takeIncomingForDisplay();
         if (incoming) {
             if (appMode != AppMode::CHAT) {
                 appMode = AppMode::CHAT;
                 chat.begin(canvas);
             }
-            char label[256];
-            snprintf(label, sizeof(label), "[feishu] %s", incoming);
-            chat.addMessage(String(label), true);
+            String label = "[feishu] ";
+            label += incoming;
+            chat.addMessage(label, true);
             chat.addMessage("thinking...", false);
             chat.scrollToBottom();
+            s_waitingForFeishuResponse = true;
             free(incoming);
         }
     }
 
     // Local agent response (from keyboard/voice)
     if (agentResponseReady && agentResponseText) {
-        chat.appendAIToken(agentResponseText);
-        chat.onAIResponseComplete();
-
-        if (strlen(agentResponseText) > 0 && Config::getDashScopeKey().length() > 0) {
-            size_t ttsLen = strlen(agentResponseText);
-            if (ttsLen > 200) ttsLen = 200;
-            char ttsText[201];
-            memcpy(ttsText, agentResponseText, ttsLen);
-            ttsText[ttsLen] = '\0';
-
-            initVoiceBuffer();
-            if (voiceBuffer) {
-                M5Cardputer.Speaker.end();
-                delay(50);
-                M5Cardputer.Mic.end();
-                auto spkCfg = M5Cardputer.Speaker.config();
-                M5Cardputer.Speaker.config(spkCfg);
-                M5Cardputer.Speaker.begin();
-
-                ttsSamples = DashScopeTTS::synthesize(ttsText, voiceBuffer, voiceBufferSamples);
-                if (ttsSamples > 0) {
-                    ttsPlaying = true;
-                    M5Cardputer.Speaker.playRaw(voiceBuffer, ttsSamples, M5CLAW_TTS_SAMPLE_RATE, false);
-                } else {
-                    releaseVoiceBuffer();
-                }
-            }
+        if (s_discardAgentResponse) {
+            Serial.println("[MAIN] Discarding cancelled agent response");
+            s_discardAgentResponse = false;
+        } else {
+            chat.appendAIToken(agentResponseText);
+            chat.onAIResponseComplete();
+            companion.triggerIdle();
         }
-
-        companion.triggerIdle();
         free(agentResponseText);
         agentResponseText = nullptr;
         agentResponseReady = false;
@@ -363,7 +335,10 @@ void loop() {
     // External (feishu) AI response ready → update the "thinking..." bubble
     if (Agent::hasExternalConv()) {
         ExternalConv conv = Agent::takeExternalConv();
-        if (conv.aiText) {
+        if (s_discardAgentResponse) {
+            Serial.println("[MAIN] Discarding cancelled external conv");
+            s_discardAgentResponse = false;
+        } else if (conv.aiText) {
             if (appMode != AppMode::CHAT) {
                 appMode = AppMode::CHAT;
                 chat.begin(canvas);
@@ -371,13 +346,9 @@ void loop() {
             chat.appendAIToken(conv.aiText);
             chat.onAIResponseComplete();
         }
+        s_waitingForFeishuResponse = false;
         free(conv.userText);
         free(conv.aiText);
-    }
-
-    if (ttsPlaying && !M5Cardputer.Speaker.isPlaying()) {
-        ttsPlaying = false;
-        releaseVoiceBuffer();
     }
 
     dispatchOutbound();
@@ -451,15 +422,8 @@ void loop() {
                            && !ks.tab && !ks.enter && !ks.del;
 
             if (!offlineMode && fnDown && fnAlone && !voiceRecording
-                && !Agent::isBusy() && !ttsPlaying
+                && !Agent::isBusy()
                 && Config::getDashScopeKey().length() > 0) {
-                initVoiceBuffer();
-                chat.update(canvas);
-                canvas.fillRect(0, SCREEN_H - 16, SCREEN_W, 16, rgb565(50, 50, 200));
-                canvas.setTextColor(Color::WHITE);
-                canvas.setTextSize(1);
-                canvas.drawString("Connecting...", 80, SCREEN_H - 12);
-                canvas.pushSprite(0, 0);
                 startVoiceRecording();
             }
             if (fnUp && voiceRecording) {
@@ -494,12 +458,21 @@ void loop() {
             pWordChar = curWordChar;
 
             if (!voiceRecording) {
-                if (altDown) {
+                // Fn+C: cancel ongoing agent generation
+                if (ks.fn && charDown && curWordChar == 'c'
+                    && (Agent::isBusy() || chat.isWaitingForAI())) {
+                    Serial.println("[MAIN] Fn+C: cancelling generation");
+                    Agent::requestAbort();
+                    chat.cancelWaiting();
+                    s_discardAgentResponse = true;
+                    if (s_waitingForFeishuResponse) {
+                        s_waitingForFeishuResponse = false;
+                    }
+                } else if (altDown) {
                     playTransition(canvas, false);
                     enterCompanionMode();
                     break;
-                }
-                if (tabDown) {
+                } else if (tabDown) {
                     chat.scrollUp();
                 } else if (ctrlDown) {
                     if (chat.isAtBottom()) {
@@ -526,7 +499,6 @@ void loop() {
                     String msg = chat.takePendingMessage();
                     Serial.printf("[CHAT] Sending: %s\n", msg.c_str());
                     companion.triggerTalk();
-                    releaseVoiceBuffer();
 
                     Agent::sendMessage(msg.c_str(), onAgentResponse);
 
@@ -537,12 +509,6 @@ void loop() {
                     pWordChar = (ks.word.size() > 0) ? ks.word[0] : 0;
                     enterDown = delDown = tabDown = altDown = ctrlDown = charDown = false;
                 }
-            }
-
-            if (ttsPlaying && (enterDown || delDown || tabDown || altDown || charDown || fnDown)) {
-                M5Cardputer.Speaker.stop();
-                ttsPlaying = false;
-                releaseVoiceBuffer();
             }
 
             chat.update(canvas);
@@ -561,11 +527,6 @@ void loop() {
                     snprintf(recLabel, sizeof(recLabel), "Recording... %.1fs", dur);
                     canvas.drawString(recLabel, 70, SCREEN_H - 12);
                 }
-            } else if (ttsPlaying) {
-                canvas.fillRect(0, SCREEN_H - 16, SCREEN_W, 16, rgb565(50, 120, 200));
-                canvas.setTextColor(Color::WHITE);
-                canvas.setTextSize(1);
-                canvas.drawString("Speaking...", 85, SCREEN_H - 12);
             } else if (Agent::isBusy()) {
                 canvas.fillRect(0, SCREEN_H - 16, SCREEN_W, 16, rgb565(80, 80, 80));
                 canvas.setTextColor(rgb565(200, 200, 200));
@@ -586,102 +547,13 @@ static void onAgentResponse(const char* text) {
     agentResponseReady = true;
 }
 
-static bool s_feishuPausedForVoice = false;
-
-static void drawProgressBar(const char* label, int percent) {
-    canvas.fillScreen(rgb565(30, 30, 40));
-    canvas.setTextColor(Color::WHITE);
-    canvas.setTextSize(1);
-    canvas.drawString(label, (SCREEN_W - strlen(label) * 6) / 2, 45);
-
-    int barW = 160, barH = 10;
-    int barX = (SCREEN_W - barW) / 2, barY = 68;
-    canvas.drawRect(barX, barY, barW, barH, Color::WHITE);
-    int fillW = (barW - 2) * percent / 100;
-    if (fillW > 0) canvas.fillRect(barX + 1, barY + 1, fillW, barH - 2, rgb565(80, 180, 80));
-
-    char pct[8];
-    snprintf(pct, sizeof(pct), "%d%%", percent);
-    canvas.drawString(pct, (SCREEN_W - strlen(pct) * 6) / 2, barY + 14);
-    canvas.pushSprite(0, 0);
-}
-
-void initVoiceBuffer() {
-    if (voiceBuffer) return;
-
-    drawProgressBar("Loading voice...", 10);
-
+void startVoiceRecording() {
     if (FeishuBot::isRunning()) {
         FeishuBot::stop();
         s_feishuPausedForVoice = true;
-        drawProgressBar("Loading voice...", 30);
-    }
-    delay(100);
-
-    drawProgressBar("Loading voice...", 50);
-
-    const size_t TLS_RESERVE = 35 * 1024;
-    const size_t MAX_SAMPLES = 60000;
-    const size_t MIN_SAMPLES = 8000;
-
-    size_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-    size_t freeHeap = ESP.getFreeHeap();
-    size_t usable = (largestBlock > TLS_RESERVE) ? largestBlock - TLS_RESERVE : 0;
-
-    size_t maxSamples = usable / sizeof(int16_t);
-    if (maxSamples > MAX_SAMPLES) maxSamples = MAX_SAMPLES;
-    maxSamples = (maxSamples / 1000) * 1000;
-
-    if (maxSamples < MIN_SAMPLES) {
-        Serial.printf("[VOICE] Buffer: FAIL, largest_block=%d heap=%d\n",
-                      (int)largestBlock, (int)freeHeap);
-        drawProgressBar("Voice: low memory", 100);
-        delay(800);
-        if (s_feishuPausedForVoice) { FeishuBot::resume(); s_feishuPausedForVoice = false; }
-        return;
+        Serial.printf("[VOICE] Feishu paused for STT, heap=%d\n", ESP.getFreeHeap());
     }
 
-    size_t bytes = maxSamples * sizeof(int16_t);
-    voiceBuffer = (int16_t*)heap_caps_malloc(bytes, MALLOC_CAP_8BIT);
-    while (!voiceBuffer && maxSamples > MIN_SAMPLES) {
-        maxSamples -= 4000;
-        bytes = maxSamples * sizeof(int16_t);
-        voiceBuffer = (int16_t*)heap_caps_malloc(bytes, MALLOC_CAP_8BIT);
-    }
-
-    drawProgressBar("Loading voice...", 90);
-
-    if (voiceBuffer) {
-        voiceBufferSamples = maxSamples;
-        Serial.printf("[VOICE] Buffer: OK, %d samples (%.1fs @24k) heap=%d\n",
-                      (int)voiceBufferSamples,
-                      (float)voiceBufferSamples / M5CLAW_TTS_SAMPLE_RATE,
-                      ESP.getFreeHeap());
-        drawProgressBar("Voice ready!", 100);
-    } else {
-        voiceBufferSamples = 0;
-        Serial.printf("[VOICE] Buffer: FAIL, heap=%d largest=%d\n",
-                      (int)freeHeap, (int)largestBlock);
-        drawProgressBar("Voice: alloc failed", 100);
-        delay(800);
-        if (s_feishuPausedForVoice) { FeishuBot::resume(); s_feishuPausedForVoice = false; }
-    }
-}
-
-void releaseVoiceBuffer() {
-    if (!voiceBuffer) return;
-    free(voiceBuffer);
-    voiceBuffer = nullptr;
-    voiceBufferSamples = 0;
-    recordedSamples = 0;
-    if (s_feishuPausedForVoice) {
-        FeishuBot::resume();
-        s_feishuPausedForVoice = false;
-        Serial.printf("[VOICE] Buffer freed, Feishu resumed, heap=%d\n", ESP.getFreeHeap());
-    }
-}
-
-void startVoiceRecording() {
     M5Cardputer.Speaker.end();
 
     if (!sttChunkBuf) {
@@ -689,6 +561,7 @@ void startVoiceRecording() {
     }
     if (!sttChunkBuf) {
         Serial.println("[VOICE] Failed to alloc chunk buffer");
+        if (s_feishuPausedForVoice) { FeishuBot::resume(); s_feishuPausedForVoice = false; }
         return;
     }
 
@@ -700,18 +573,24 @@ void startVoiceRecording() {
     M5Cardputer.Mic.config(micCfg);
     M5Cardputer.Mic.begin();
 
+    chat.update(canvas);
+    canvas.fillRect(0, SCREEN_H - 16, SCREEN_W, 16, rgb565(50, 50, 200));
+    canvas.setTextColor(Color::WHITE);
+    canvas.setTextSize(1);
+    canvas.drawString("Connecting...", 80, SCREEN_H - 12);
+    canvas.pushSprite(0, 0);
+
     if (!DashScopeSTT::beginStream()) {
         Serial.println("[VOICE] STT stream failed");
         M5Cardputer.Mic.end();
-        M5Cardputer.Speaker.begin();
         free(sttChunkBuf); sttChunkBuf = nullptr;
+        if (s_feishuPausedForVoice) { FeishuBot::resume(); s_feishuPausedForVoice = false; }
         return;
     }
 
     memset(sttChunkBuf, 0, STT_CHUNK_SAMPLES * sizeof(int16_t));
     M5Cardputer.Mic.record(sttChunkBuf, STT_CHUNK_SAMPLES, M5CLAW_STT_SAMPLE_RATE);
     voiceRecording = true;
-    recordedSamples = 0;
     recordingStartMs = millis();
     Serial.printf("[VOICE] Streaming started, heap=%d\n", ESP.getFreeHeap());
 }
@@ -721,7 +600,6 @@ void streamVoiceData() {
 
     if (!M5Cardputer.Mic.isRecording()) {
         DashScopeSTT::feedAudio(sttChunkBuf, STT_CHUNK_SAMPLES);
-        recordedSamples += STT_CHUNK_SAMPLES;
         memset(sttChunkBuf, 0, STT_CHUNK_SAMPLES * sizeof(int16_t));
         M5Cardputer.Mic.record(sttChunkBuf, STT_CHUNK_SAMPLES, M5CLAW_STT_SAMPLE_RATE);
     }
@@ -744,10 +622,14 @@ String stopVoiceRecording() {
     free(sttChunkBuf);
     sttChunkBuf = nullptr;
 
-    M5Cardputer.Speaker.begin();
+    if (s_feishuPausedForVoice) {
+        FeishuBot::resume();
+        s_feishuPausedForVoice = false;
+        Serial.printf("[VOICE] Feishu resumed, heap=%d\n", ESP.getFreeHeap());
+    }
 
     float duration = (float)(millis() - recordingStartMs) / 1000.0f;
-    Serial.printf("[VOICE] Stopped streaming, %.2fs, result: %s\n", duration, result.c_str());
+    Serial.printf("[VOICE] Done, %.2fs, result: %s\n", duration, result.c_str());
     return result;
 }
 
@@ -1001,7 +883,6 @@ void initOnlineServices() {
 
     if (Config::getDashScopeKey().length() > 0) {
         DashScopeSTT::init(Config::getDashScopeKey().c_str());
-        DashScopeTTS::init(Config::getDashScopeKey().c_str());
     }
 
     weatherClient.begin(Config::getCity());

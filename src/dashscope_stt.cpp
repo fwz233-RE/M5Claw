@@ -62,7 +62,7 @@ void DashScopeSTT::init(const char* apiKey) {
     Serial.println("[STT] Initialized");
 }
 
-bool DashScopeSTT::beginStream() {
+bool DashScopeSTT::beginStream(SttAbortCheckFn shouldAbort) {
     if (!s_api_key[0]) return false;
     if (s_streaming) endStream();
 
@@ -89,6 +89,11 @@ bool DashScopeSTT::beginStream() {
 
     unsigned long start = millis();
     while (!s_ws_connected && millis() - start < 10000) {
+        if (shouldAbort && shouldAbort()) {
+            Serial.println("[STT] Aborted during connect");
+            delete s_ws; s_ws = nullptr;
+            return false;
+        }
         s_ws->loop();
         delay(10);
     }
@@ -117,6 +122,11 @@ bool DashScopeSTT::beginStream() {
 
     start = millis();
     while (!s_task_started && !s_ws_done && millis() - start < 5000) {
+        if (shouldAbort && shouldAbort()) {
+            Serial.println("[STT] Aborted during task start");
+            delete s_ws; s_ws = nullptr;
+            return false;
+        }
         s_ws->loop();
         delay(10);
     }

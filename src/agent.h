@@ -22,11 +22,9 @@ namespace Agent {
     void start();
 
     void sendMessage(const char* text, AgentResponseCallback onResponse);
-    void sendMessageEx(const char* text, const char* channel, const char* chatId,
-                       AgentResponseExCallback onResponse);
 
     bool isBusy();
-    bool isReady();
+    void requestAbort();
 
     bool hasExternalConv();
     ExternalConv takeExternalConv();

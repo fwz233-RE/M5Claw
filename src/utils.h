@@ -25,39 +25,6 @@ namespace Color {
     constexpr uint16_t TRANSPARENT = rgb565(255, 0, 255);
 }
 
-inline int filterForDisplayBuf(const char* src, char* dst, int dstSize) {
-    const char* p = src;
-    int i = 0;
-    while (*p && i < dstSize - 1) {
-        uint8_t c = (uint8_t)*p;
-        if (c < 0x80) {
-            if (c == '*' || c == '_') { p++; continue; }
-            if (c >= 0x20 || c == '\n') dst[i++] = (char)c;
-            p++;
-        } else if (c < 0xC0) {
-            p++;
-        } else if (c < 0xE0) {
-            if (p[1] && i + 1 < dstSize - 1) { dst[i++] = p[0]; dst[i++] = p[1]; }
-            p += 2;
-        } else if (c < 0xF0) {
-            if (p[1] && p[2] && i + 2 < dstSize - 1) { dst[i++] = p[0]; dst[i++] = p[1]; dst[i++] = p[2]; }
-            p += 3;
-        } else {
-            p += 4;
-        }
-    }
-    dst[i] = '\0';
-    return i;
-}
-
-inline String filterForDisplay(const String& input) {
-    int len = input.length();
-    if (len > 512) len = 512;
-    char buf[512];
-    int outLen = filterForDisplayBuf(input.c_str(), buf, sizeof(buf));
-    return String(buf);
-}
-
 struct Timer {
     unsigned long interval;
     unsigned long lastTick;

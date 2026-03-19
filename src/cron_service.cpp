@@ -134,10 +134,6 @@ void CronService::start() {
     }
 }
 
-void CronService::stop() {
-    if (s_timer) { xTimerStop(s_timer, 0); xTimerDelete(s_timer, 0); s_timer = nullptr; }
-}
-
 bool CronService::addJob(CronJob* job) {
     // compact disabled jobs
     int active = 0;

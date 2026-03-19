@@ -156,21 +156,23 @@ static bool tool_web_search(const char* input, char* output, size_t sz) {
     reqDoc["search_engine"] = M5CLAW_SEARCH_ENGINE;
     reqDoc["search_query"] = query;
     reqDoc["count"] = M5CLAW_SEARCH_MAX_RESULTS;
+    reqDoc["search_recency_filter"] = "oneWeek";
+    reqDoc["content_size"] = "low";
     String reqBody;
     serializeJson(reqDoc, reqBody);
 
     WiFiClientSecure* client = new WiFiClientSecure();
     if (!client) { strlcpy(output, "Out of memory for TLS", sz); return true; }
     client->setInsecure();
-    client->setTimeout(10000);
+    client->setTimeout(30000);
 
     if (WiFi.status() != WL_CONNECTED) { delete client; strlcpy(output, "WiFi not connected", sz); return true; }
 
     IPAddress ip;
     bool resolved = false;
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 3; i++) {
         if (WiFi.hostByName(M5CLAW_SEARCH_HOST, ip)) { resolved = true; break; }
-        delay(100);
+        delay(200);
     }
     if (!resolved) { delete client; strlcpy(output, "DNS failed for search API", sz); return true; }
     Serial.printf("[SEARCH] DNS %s -> %s\n", M5CLAW_SEARCH_HOST, ip.toString().c_str());
@@ -187,10 +189,9 @@ static bool tool_web_search(const char* input, char* output, size_t sz) {
     client->println();
     client->print(reqBody);
 
-    unsigned long deadline = millis() + 20000;
     int state = 0;
     bool headersDone = false;
-    while (client->connected() && millis() < deadline) {
+    while (client->connected()) {
         if (!client->available()) { delay(1); continue; }
         char c = client->read();
         switch (state) {
@@ -202,11 +203,23 @@ static bool tool_web_search(const char* input, char* output, size_t sz) {
         if (headersDone) break;
     }
 
-    char* respBuf = (char*)allocPsram(M5CLAW_SEARCH_BUF_SIZE);
+    const size_t SEARCH_HEAP_RESERVE = 8 * 1024;
+    size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    size_t bufSize = (largest > SEARCH_HEAP_RESERVE) ? largest - SEARCH_HEAP_RESERVE : 0;
+    if (bufSize > 48 * 1024) bufSize = 48 * 1024;
+
+    char* respBuf = nullptr;
+    if (bufSize >= 6 * 1024) {
+        respBuf = (char*)heap_caps_malloc(bufSize, MALLOC_CAP_8BIT);
+    }
+    if (!respBuf) { bufSize = 32 * 1024; respBuf = (char*)heap_caps_malloc(bufSize, MALLOC_CAP_8BIT); }
+    if (!respBuf) { bufSize = 16 * 1024; respBuf = (char*)heap_caps_malloc(bufSize, MALLOC_CAP_8BIT); }
+    if (!respBuf) { bufSize =  8 * 1024; respBuf = (char*)heap_caps_malloc(bufSize, MALLOC_CAP_8BIT); }
     if (!respBuf) { client->stop(); delete client; strlcpy(output, "Out of memory for search", sz); return true; }
+    Serial.printf("[SEARCH] Buffer %dKB (heap=%d)\n", (int)(bufSize / 1024), ESP.getFreeHeap());
 
     int respLen = 0;
-    while (respLen < (int)M5CLAW_SEARCH_BUF_SIZE - 1 && millis() < deadline) {
+    while (respLen < (int)bufSize - 1) {
         if (client->available()) {
             respBuf[respLen++] = client->read();
         } else if (!client->connected()) break;
@@ -216,7 +229,7 @@ static bool tool_web_search(const char* input, char* output, size_t sz) {
     client->stop();
     delete client;
 
-    Serial.printf("[SEARCH] Response %d bytes\n", respLen);
+    Serial.printf("[SEARCH] Response %d / %u bytes\n", respLen, (unsigned)bufSize);
 
     char* jsonStart = strchr(respBuf, '{');
     if (!jsonStart) {
@@ -228,15 +241,36 @@ static bool tool_web_search(const char* input, char* output, size_t sz) {
 
     JsonDocument respDoc;
     DeserializationError err = deserializeJson(respDoc, jsonStart);
+
+    if (err == DeserializationError::IncompleteInput) {
+        char* lastBound = nullptr;
+        char* p = jsonStart;
+        while ((p = strstr(p, "},{\"")) != nullptr) {
+            lastBound = p;
+            p++;
+        }
+        if (lastBound) {
+            lastBound[1] = ']';
+            lastBound[2] = '}';
+            lastBound[3] = '\0';
+            respDoc.clear();
+            err = deserializeJson(respDoc, jsonStart);
+            if (!err) {
+                Serial.println("[SEARCH] Repaired truncated JSON");
+            }
+        }
+    }
+
+    heap_caps_free(respBuf);
+    respBuf = nullptr;
+
     if (err) {
         Serial.printf("[SEARCH] JSON parse error: %s\n", err.c_str());
-        heap_caps_free(respBuf);
         strlcpy(output, "Failed to parse search results", sz);
         return true;
     }
-    heap_caps_free(respBuf);
 
-    if (respDoc.containsKey("error")) {
+    if (!respDoc["error"].isNull()) {
         const char* errMsg = respDoc["error"]["message"] | "Unknown API error";
         Serial.printf("[SEARCH] API error: %s\n", errMsg);
         snprintf(output, sz, "Search API error: %s", errMsg);
@@ -254,17 +288,29 @@ static bool tool_web_search(const char* input, char* output, size_t sz) {
     size_t off = 0;
     int idx = 0;
     for (JsonVariant item : results) {
-        if (idx >= M5CLAW_SEARCH_MAX_RESULTS || off >= sz - 60) break;
-        const char* title = item["title"] | "(no title)";
-        const char* link = item["link"] | "";
+        if (idx >= M5CLAW_SEARCH_MAX_RESULTS || off >= sz - 40) break;
+        const char* title   = item["title"]   | "";
+        const char* media   = item["media"]   | "";
         const char* content = item["content"] | "";
-        int w = snprintf(output + off, sz - off, "%d. %s\n   %s\n   %s\n\n",
-                         idx + 1, title, link, content);
-        if (w > 0) off += w;
+        const char* date    = item["publish_date"] | "";
+
+        char brief[128];
+        strlcpy(brief, content, sizeof(brief));
+
+        int w;
+        if (date[0]) {
+            w = snprintf(output + off, sz - off, "%d. [%s] %s (%s)\n%s\n\n",
+                         idx + 1, media, title, date, brief);
+        } else {
+            w = snprintf(output + off, sz - off, "%d. [%s] %s\n%s\n\n",
+                         idx + 1, media, title, brief);
+        }
+        if (w <= 0 || (size_t)w >= sz - off) break;
+        off += w;
         idx++;
     }
 
-    Serial.printf("[SEARCH] Done, %d results\n", idx);
+    Serial.printf("[SEARCH] Formatted %d / %d results into %u bytes\n", idx, (int)results.size(), (unsigned)off);
     return true;
 }
 
