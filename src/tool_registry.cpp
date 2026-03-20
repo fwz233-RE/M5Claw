@@ -137,6 +137,32 @@ static bool tool_list_dir(const char* input, char* output, size_t sz) {
     return true;
 }
 
+/* ── chunked transfer decoding ─────────────────────── */
+static void decode_chunked_search(char* buf, int* len) {
+    if (!buf || !len || *len <= 0) return;
+    int i = 0;
+    while (i < *len && (buf[i] == ' ' || buf[i] == '\t' || buf[i] == '\r' || buf[i] == '\n')) i++;
+    if (i < *len && (buf[i] == '{' || buf[i] == '[')) return;
+
+    char* src = buf;
+    char* dst = buf;
+    char* end = buf + *len;
+    while (src < end) {
+        char* line_end = strstr(src, "\r\n");
+        if (!line_end) break;
+        unsigned long chunk_size = strtoul(src, nullptr, 16);
+        if (chunk_size == 0) break;
+        src = line_end + 2;
+        if (src + chunk_size > end) break;
+        memmove(dst, src, chunk_size);
+        dst += chunk_size;
+        src += chunk_size;
+        if (src + 2 <= end && src[0] == '\r' && src[1] == '\n') src += 2;
+    }
+    *len = (int)(dst - buf);
+    buf[*len] = '\0';
+}
+
 /* ── GLM web_search (Zhipu AI) ─────────────────────── */
 static bool tool_web_search(const char* input, char* output, size_t sz) {
     JsonDocument doc;
@@ -229,6 +255,7 @@ static bool tool_web_search(const char* input, char* output, size_t sz) {
     client->stop();
     delete client;
 
+    decode_chunked_search(respBuf, &respLen);
     Serial.printf("[SEARCH] Response %d / %u bytes\n", respLen, (unsigned)bufSize);
 
     char* jsonStart = strchr(respBuf, '{');
@@ -242,7 +269,7 @@ static bool tool_web_search(const char* input, char* output, size_t sz) {
     JsonDocument respDoc;
     DeserializationError err = deserializeJson(respDoc, jsonStart);
 
-    if (err == DeserializationError::IncompleteInput) {
+    if (err == DeserializationError::IncompleteInput || err == DeserializationError::InvalidInput) {
         char* lastBound = nullptr;
         char* p = jsonStart;
         while ((p = strstr(p, "},{\"")) != nullptr) {
@@ -294,16 +321,13 @@ static bool tool_web_search(const char* input, char* output, size_t sz) {
         const char* content = item["content"] | "";
         const char* date    = item["publish_date"] | "";
 
-        char brief[128];
-        strlcpy(brief, content, sizeof(brief));
-
         int w;
         if (date[0]) {
             w = snprintf(output + off, sz - off, "%d. [%s] %s (%s)\n%s\n\n",
-                         idx + 1, media, title, date, brief);
+                         idx + 1, media, title, date, content);
         } else {
             w = snprintf(output + off, sz - off, "%d. [%s] %s\n%s\n\n",
-                         idx + 1, media, title, brief);
+                         idx + 1, media, title, content);
         }
         if (w <= 0 || (size_t)w >= sz - off) break;
         off += w;

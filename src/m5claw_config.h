@@ -40,7 +40,7 @@
 #define M5CLAW_SEARCH_HOST             "open.bigmodel.cn"
 #define M5CLAW_SEARCH_PATH             "/api/paas/v4/web_search"
 #define M5CLAW_SEARCH_ENGINE           "search_std"
-#define M5CLAW_SEARCH_MAX_RESULTS      25
+#define M5CLAW_SEARCH_MAX_RESULTS      5
 
 // Cron Service
 #define M5CLAW_CRON_FILE               "/cron.json"

@@ -62,7 +62,7 @@ static char* stripMarkdownBold(const char* text) {
     return out;
 }
 
-#define TOOL_OUTPUT_SIZE (6 * 1024)
+#define TOOL_OUTPUT_SIZE (8 * 1024)
 
 static void* alloc_prefer_psram(size_t size) {
     void* p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -160,9 +160,11 @@ static void processRequest(AgentRequest& req, char* system_prompt, char* tool_ou
                 rebuiltUser["content"] = req.text;
             }
 
+            const char* iter_tools = (iteration >= M5CLAW_AGENT_MAX_TOOL_ITER - 2)
+                                     ? nullptr : tools_json;
             s_freeable_messages = &messages;
             llm_client_set_pre_read_free(preReadFree);
-            ok = llm_chat_tools(system_prompt, *messages, tools_json, &resp);
+            ok = llm_chat_tools(system_prompt, *messages, iter_tools, &resp);
             llm_client_set_pre_read_free(nullptr);
             s_freeable_messages = nullptr;
 
