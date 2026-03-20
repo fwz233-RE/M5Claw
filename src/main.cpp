@@ -135,11 +135,78 @@ void fillBuildTimeDefaults() {
     if (Config::getCity().length() == 0) Config::setCity("Beijing");
 }
 
+// ── M5Burner NVS Configure protocol ──────────────────────────
+static const char* const NVS_KEYS[] = {
+    "ssid", "pass", "llm_key", "llm_prov", "llm_model",
+    "llm_host", "llm_path", "ds_key", "city",
+    "glm_key", "fs_appid", "fs_secret"
+};
+
+static String nvsGet(const char* key) {
+    if (strcmp(key, "ssid") == 0)      return Config::getSSID();
+    if (strcmp(key, "pass") == 0)      return Config::getPassword();
+    if (strcmp(key, "llm_key") == 0)   return Config::getLlmApiKey();
+    if (strcmp(key, "llm_prov") == 0)  return Config::getLlmProvider();
+    if (strcmp(key, "llm_model") == 0) return Config::getLlmModel();
+    if (strcmp(key, "llm_host") == 0)  return Config::getLlmHost();
+    if (strcmp(key, "llm_path") == 0)  return Config::getLlmPath();
+    if (strcmp(key, "ds_key") == 0)    return Config::getDashScopeKey();
+    if (strcmp(key, "city") == 0)      return Config::getCity();
+    if (strcmp(key, "glm_key") == 0)   return Config::getGlmSearchKey();
+    if (strcmp(key, "fs_appid") == 0)  return Config::getFeishuAppId();
+    if (strcmp(key, "fs_secret") == 0) return Config::getFeishuAppSecret();
+    return "";
+}
+
+static void nvsSet(const char* key, const char* value) {
+    if (strcmp(key, "ssid") == 0)      Config::setSSID(value);
+    else if (strcmp(key, "pass") == 0)      Config::setPassword(value);
+    else if (strcmp(key, "llm_key") == 0)   Config::setLlmApiKey(value);
+    else if (strcmp(key, "llm_prov") == 0)  Config::setLlmProvider(value);
+    else if (strcmp(key, "llm_model") == 0) Config::setLlmModel(value);
+    else if (strcmp(key, "llm_host") == 0)  Config::setLlmHost(value);
+    else if (strcmp(key, "llm_path") == 0)  Config::setLlmPath(value);
+    else if (strcmp(key, "ds_key") == 0)    Config::setDashScopeKey(value);
+    else if (strcmp(key, "city") == 0)      Config::setCity(value);
+    else if (strcmp(key, "glm_key") == 0)   Config::setGlmSearchKey(value);
+    else if (strcmp(key, "fs_appid") == 0)  Config::setFeishuAppId(value);
+    else if (strcmp(key, "fs_secret") == 0) Config::setFeishuAppSecret(value);
+    Config::save();
+}
+
+static bool handleBurnerNVS(const String& line) {
+    if (!line.startsWith("CMD::")) return false;
+
+    if (line.startsWith("CMD::INIT:")) {
+        Serial.println("__NVS_EXIST__");
+    } else if (line.startsWith("CMD::LIST:")) {
+        String keys;
+        for (auto k : NVS_KEYS) { keys += k; keys += '/'; }
+        Serial.println(keys);
+    } else if (line.startsWith("CMD::GET:")) {
+        String key = line.substring(9);
+        Serial.println(nvsGet(key.c_str()));
+    } else if (line.startsWith("CMD::SET:")) {
+        String payload = line.substring(9);
+        int eq = payload.indexOf('=');
+        if (eq > 0) {
+            String key = payload.substring(0, eq);
+            String val = payload.substring(eq + 1);
+            nvsSet(key.c_str(), val.c_str());
+        }
+        Serial.println("OK");
+    }
+    return true;
+}
+
+// ── Serial CLI ───────────────────────────────────────────────
 void processSerialCommands() {
     if (!Serial.available()) return;
     String line = Serial.readStringUntil('\n');
     line.trim();
     if (line.length() == 0) return;
+
+    if (handleBurnerNVS(line)) return;
 
     int sep = line.indexOf(' ');
     String cmd = (sep > 0) ? line.substring(0, sep) : line;
