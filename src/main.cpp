@@ -16,11 +16,12 @@
 #include "context_builder.h"
 #include "dashscope_stt.h"
 #include "message_bus.h"
-#include "feishu_bot.h"
+#include "wechat_bot.h"
 #include "cron_service.h"
 #include "heartbeat.h"
 #include "skill_loader.h"
 #include <esp_heap_caps.h>
+#include <freertos/queue.h>
 #include "soc/rtc_cntl_reg.h"
 
 #ifndef USER_WIFI_SSID
@@ -50,11 +51,11 @@
 #ifndef USER_LLM_PATH
 #define USER_LLM_PATH ""
 #endif
-#ifndef USER_FEISHU_APP_ID
-#define USER_FEISHU_APP_ID ""
+#ifndef USER_WECHAT_TOKEN
+#define USER_WECHAT_TOKEN ""
 #endif
-#ifndef USER_FEISHU_APP_SECRET
-#define USER_FEISHU_APP_SECRET ""
+#ifndef USER_WECHAT_API_HOST
+#define USER_WECHAT_API_HOST ""
 #endif
 #ifndef USER_GLM_SEARCH_KEY
 #define USER_GLM_SEARCH_KEY ""
@@ -65,7 +66,7 @@ Companion companion;
 Chat chat;
 WeatherClient weatherClient;
 
-enum class AppMode { SETUP, COMPANION, CHAT };
+enum class AppMode { SETUP, COMPANION, CHAT, WECHAT_STATUS };
 static AppMode appMode = AppMode::SETUP;
 static bool offlineMode = false;
 
@@ -81,7 +82,7 @@ static unsigned long recordingStartMs = 0;
 
 static const size_t STT_CHUNK_SAMPLES = 1600;
 static int16_t* sttChunkBuf = nullptr;
-static bool s_feishuPausedForVoice = false;
+static bool s_wechatPausedForVoice = false;
 
 void enterSetupMode();
 void updateSetupMode();
@@ -99,10 +100,13 @@ void processSerialCommands();
 void dispatchOutbound();
 
 static void onAgentResponse(const char* text);
+static void onAgentToken(const char* token);
 static volatile bool agentResponseReady = false;
 static char* agentResponseText = nullptr;
 static bool s_discardAgentResponse = false;
-static bool s_waitingForFeishuResponse = false;
+static bool s_waitingForWechatResponse = false;
+static QueueHandle_t s_tokenQueue = nullptr;
+static volatile bool s_hasStreamedTokens = false;
 
 static bool hasPreconfiguredOnlineSettings() {
     bool hasLlm = Config::getLlmApiKey().length() > 0
@@ -127,8 +131,8 @@ void fillBuildTimeDefaults() {
     setIfEmpty(Config::setCity,            Config::getCity(),            USER_CITY);
     setIfEmpty(Config::setLlmHost,         Config::getLlmHost(),         USER_LLM_HOST);
     setIfEmpty(Config::setLlmPath,         Config::getLlmPath(),         USER_LLM_PATH);
-    setIfEmpty(Config::setFeishuAppId,     Config::getFeishuAppId(),     USER_FEISHU_APP_ID);
-    setIfEmpty(Config::setFeishuAppSecret, Config::getFeishuAppSecret(), USER_FEISHU_APP_SECRET);
+    setIfEmpty(Config::setWechatToken,     Config::getWechatToken(),     USER_WECHAT_TOKEN);
+    setIfEmpty(Config::setWechatApiHost,  Config::getWechatApiHost(),   USER_WECHAT_API_HOST);
     setIfEmpty(Config::setGlmSearchKey,    Config::getGlmSearchKey(),    USER_GLM_SEARCH_KEY);
     if (Config::getLlmProvider().length() == 0) Config::setLlmProvider("anthropic");
     if (Config::getLlmModel().length() == 0) Config::setLlmModel(M5CLAW_LLM_DEFAULT_MODEL);
@@ -139,7 +143,7 @@ void fillBuildTimeDefaults() {
 static const char* const NVS_KEYS[] = {
     "ssid", "pass", "llm_key", "llm_prov", "llm_model",
     "llm_host", "llm_path", "ds_key", "city",
-    "glm_key", "fs_appid", "fs_secret"
+    "glm_key", "wc_token", "wc_host"
 };
 
 static String nvsGet(const char* key) {
@@ -153,8 +157,8 @@ static String nvsGet(const char* key) {
     if (strcmp(key, "ds_key") == 0)    return Config::getDashScopeKey();
     if (strcmp(key, "city") == 0)      return Config::getCity();
     if (strcmp(key, "glm_key") == 0)   return Config::getGlmSearchKey();
-    if (strcmp(key, "fs_appid") == 0)  return Config::getFeishuAppId();
-    if (strcmp(key, "fs_secret") == 0) return Config::getFeishuAppSecret();
+    if (strcmp(key, "wc_token") == 0)  return Config::getWechatToken();
+    if (strcmp(key, "wc_host") == 0)   return Config::getWechatApiHost();
     return "";
 }
 
@@ -169,8 +173,8 @@ static void nvsSet(const char* key, const char* value) {
     else if (strcmp(key, "ds_key") == 0)    Config::setDashScopeKey(value);
     else if (strcmp(key, "city") == 0)      Config::setCity(value);
     else if (strcmp(key, "glm_key") == 0)   Config::setGlmSearchKey(value);
-    else if (strcmp(key, "fs_appid") == 0)  Config::setFeishuAppId(value);
-    else if (strcmp(key, "fs_secret") == 0) Config::setFeishuAppSecret(value);
+    else if (strcmp(key, "wc_token") == 0)  Config::setWechatToken(value);
+    else if (strcmp(key, "wc_host") == 0)   Config::setWechatApiHost(value);
     Config::save();
 }
 
@@ -221,7 +225,7 @@ void processSerialCommands() {
         Serial.println("  set_llm_model <model>    - e.g. claude-sonnet-4-20250514");
         Serial.println("  set_ds_key <key>         - Set DashScope key");
         Serial.println("  set_city <city>          - e.g. Beijing");
-        Serial.println("  set_feishu <id> <secret> - Set Feishu bot credentials");
+        Serial.println("  set_wechat <token> <host> - Set WeChat bot credentials");
         Serial.println("  set_glm_key <key>        - Set Zhipu AI search key");
         Serial.println("  show_config              - Show current config");
         Serial.println("  reset_config             - Clear all config");
@@ -251,15 +255,15 @@ void processSerialCommands() {
     } else if (cmd == "set_city") {
         Config::setCity(val); Config::save();
         Serial.printf("City: %s\n", val.c_str());
-    } else if (cmd == "set_feishu") {
+    } else if (cmd == "set_wechat") {
         int sp = val.indexOf(' ');
         if (sp > 0) {
-            Config::setFeishuAppId(val.substring(0, sp));
-            Config::setFeishuAppSecret(val.substring(sp + 1));
+            Config::setWechatToken(val.substring(0, sp));
+            Config::setWechatApiHost(val.substring(sp + 1));
             Config::save();
-            Serial.println("Feishu credentials saved. Reboot to activate.");
+            Serial.println("WeChat credentials saved. Reboot to activate.");
         } else {
-            Serial.println("Usage: set_feishu <app_id> <app_secret>");
+            Serial.println("Usage: set_wechat <bearer_token> <api_host>");
         }
     } else if (cmd == "set_glm_key") {
         Config::setGlmSearchKey(val); Config::save();
@@ -273,8 +277,8 @@ void processSerialCommands() {
         Serial.printf("  LLM Key:       [%d chars]\n", Config::getLlmApiKey().length());
         Serial.printf("  DashScope Key: [%d chars]\n", Config::getDashScopeKey().length());
         Serial.printf("  City:          %s\n", Config::getCity().c_str());
-        Serial.printf("  Feishu App ID: [%d chars]\n", Config::getFeishuAppId().length());
-        Serial.printf("  Feishu Secret: [%d chars]\n", Config::getFeishuAppSecret().length());
+        Serial.printf("  WeChat Token:  [%d chars]\n", Config::getWechatToken().length());
+        Serial.printf("  WeChat Host:   %s\n", Config::getWechatApiHost().c_str());
         Serial.printf("  GLM Search:    [%d chars]\n", Config::getGlmSearchKey().length());
         Serial.printf("  Valid:         %s\n", Config::isValid() ? "YES" : "NO");
     } else if (cmd == "reset_config") {
@@ -293,11 +297,11 @@ void dispatchOutbound() {
     if (WiFi.status() != WL_CONNECTED) return;
     BusMessage msg;
     while (MessageBus::popOutbound(&msg, 0)) {
-        if (strcmp(msg.channel, M5CLAW_CHAN_FEISHU) == 0) {
-            if (FeishuBot::isRunning()) {
-                FeishuBot::sendMessage(msg.chat_id, msg.content);
+        if (strcmp(msg.channel, M5CLAW_CHAN_WECHAT) == 0) {
+            if (WechatBot::isPaired()) {
+                WechatBot::sendMessage(msg.chat_id, msg.content);
             } else {
-                Serial.printf("[BUS] Feishu offline, dropped reply to %s\n", msg.chat_id);
+                Serial.printf("[BUS] WeChat offline, dropped reply to %s\n", msg.chat_id);
             }
         }
         free(msg.content);
@@ -350,8 +354,9 @@ void setup() {
     SkillLoader::init();
     CronService::init();
     Heartbeat::init();
-    FeishuBot::init();
+    WechatBot::init();
     Agent::init();
+    s_tokenQueue = xQueueCreate(32, sizeof(char*));
     Serial.println("[BOOT] All services initialized");
 
     playBootAnimation(canvas);
@@ -366,20 +371,31 @@ void setup() {
 void loop() {
     M5Cardputer.update();
 
-    // Feishu incoming → show one at a time, queue the rest
-    if (FeishuBot::hasIncomingForDisplay() && !s_waitingForFeishuResponse) {
-        char* incoming = FeishuBot::takeIncomingForDisplay();
+    // Drain streaming tokens from agent → chat UI
+    if (s_tokenQueue) {
+        char* token;
+        while (xQueueReceive(s_tokenQueue, &token, 0) == pdTRUE) {
+            if (!s_discardAgentResponse) {
+                chat.appendAIToken(token);
+            }
+            free(token);
+        }
+    }
+
+    // WeChat incoming → show one at a time, queue the rest
+    if (WechatBot::hasIncomingForDisplay() && !s_waitingForWechatResponse) {
+        char* incoming = WechatBot::takeIncomingForDisplay();
         if (incoming) {
             if (appMode != AppMode::CHAT) {
                 appMode = AppMode::CHAT;
                 chat.begin(canvas);
             }
-            String label = "[feishu] ";
+            String label = "[wechat] ";
             label += incoming;
             chat.addMessage(label, true);
             chat.addMessage("thinking...", false);
             chat.scrollToBottom();
-            s_waitingForFeishuResponse = true;
+            s_waitingForWechatResponse = true;
             free(incoming);
         }
     }
@@ -390,16 +406,19 @@ void loop() {
             Serial.println("[MAIN] Discarding cancelled agent response");
             s_discardAgentResponse = false;
         } else {
-            chat.appendAIToken(agentResponseText);
+            if (!s_hasStreamedTokens) {
+                chat.appendAIToken(agentResponseText);
+            }
             chat.onAIResponseComplete();
             companion.triggerIdle();
         }
         free(agentResponseText);
         agentResponseText = nullptr;
         agentResponseReady = false;
+        s_hasStreamedTokens = false;
     }
 
-    // External (feishu) AI response ready → update the "thinking..." bubble
+    // External AI response (wechat reply / cron notification / heartbeat)
     if (Agent::hasExternalConv()) {
         ExternalConv conv = Agent::takeExternalConv();
         if (s_discardAgentResponse) {
@@ -410,10 +429,23 @@ void loop() {
                 appMode = AppMode::CHAT;
                 chat.begin(canvas);
             }
-            chat.appendAIToken(conv.aiText);
-            chat.onAIResponseComplete();
+            if (s_waitingForWechatResponse) {
+                chat.appendAIToken(conv.aiText);
+                chat.onAIResponseComplete();
+            } else if (conv.userText) {
+                String label = "[";
+                label += conv.channel;
+                label += "] ";
+                label += conv.userText;
+                chat.addMessage(label, true);
+                chat.addMessage(conv.aiText, false);
+                chat.scrollToBottom();
+            } else {
+                chat.addMessage(conv.aiText, false);
+                chat.scrollToBottom();
+            }
         }
-        s_waitingForFeishuResponse = false;
+        s_waitingForWechatResponse = false;
         free(conv.userText);
         free(conv.aiText);
     }
@@ -438,38 +470,51 @@ void loop() {
             auto ks = M5Cardputer.Keyboard.keysState();
             bool keyPressed = M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed();
 
+            static bool prevFn = false;
+            static bool fnComboUsed = false;
+
+            bool fnDown = ks.fn && !prevFn;
+            bool fnUp   = !ks.fn && prevFn;
+
+            if (fnDown) fnComboUsed = false;
+
             if (keyPressed) {
                 if (ks.tab) {
+                    prevFn = ks.fn;
                     playTransition(canvas, true);
                     enterChatMode();
                     break;
                 }
-                if (ks.fn && ks.word.size() > 0 && ks.word[0] == 'w') {
-                    companion.toggleWeatherSim();
+                if (ks.ctrl) {
+                    prevFn = ks.fn;
+                    playTransitionVertical(canvas, true);
+                    appMode = AppMode::WECHAT_STATUS;
                     break;
                 }
-                if (ks.fn && ks.word.size() > 0 && ks.word[0] == 'r') {
-                    WiFi.disconnect(true);
-                    Config::setSSID("");
-                    Config::setPassword("");
-                    Config::save();
-                    enterSetupMode();
-                    break;
-                }
-                if (companion.isWeatherSimMode() && ks.word.size() > 0) {
-                    char ch = ks.word[0];
-                    if (ch >= '1' && ch <= '8') {
-                        companion.setSimWeatherType(ch - '0');
+                if (ks.fn && ks.word.size() > 0) {
+                    fnComboUsed = true;
+                    if (ks.word[0] == 'r') {
+                        WiFi.disconnect(true);
+                        Config::setSSID("");
+                        Config::setPassword("");
+                        Config::save();
+                        prevFn = ks.fn;
+                        enterSetupMode();
                         break;
                     }
                 }
+                if (!ks.fn) Companion::playKeyClick();
+            }
+
+            if (fnUp && !fnComboUsed) {
+                companion.cycleSunset();
                 Companion::playKeyClick();
             }
 
+            prevFn = ks.fn;
+
             if (!offlineMode) weatherClient.update();
-            if (!companion.isWeatherSimMode()) {
-                companion.setWeather(weatherClient.getData());
-            }
+            companion.setWeather(weatherClient.getData());
             companion.update(canvas);
             companion.drawNotificationOverlay(canvas);
             canvas.pushSprite(0, 0);
@@ -532,8 +577,8 @@ void loop() {
                     Agent::requestAbort();
                     chat.cancelWaiting();
                     s_discardAgentResponse = true;
-                    if (s_waitingForFeishuResponse) {
-                        s_waitingForFeishuResponse = false;
+                    if (s_waitingForWechatResponse) {
+                        s_waitingForWechatResponse = false;
                     }
                 } else if (altDown) {
                     playTransition(canvas, false);
@@ -567,7 +612,8 @@ void loop() {
                     Serial.printf("[CHAT] Sending: %s\n", msg.c_str());
                     companion.triggerTalk();
 
-                    Agent::sendMessage(msg.c_str(), onAgentResponse);
+                    s_hasStreamedTokens = false;
+                    Agent::sendMessage(msg.c_str(), onAgentResponse, onAgentToken);
 
                     M5Cardputer.update();
                     ks = M5Cardputer.Keyboard.keysState();
@@ -603,6 +649,123 @@ void loop() {
             canvas.pushSprite(0, 0);
             break;
         }
+
+        case AppMode::WECHAT_STATUS: {
+            static bool pairStarted = false;
+            static unsigned long lastPollMs = 0;
+            static const char* qrContent = nullptr;
+
+            auto ks = M5Cardputer.Keyboard.keysState();
+            bool keyPressed = M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed();
+
+            if (keyPressed) {
+                if (ks.tab) {
+                    WechatBot::cancelPairing();
+                    pairStarted = false;
+                    qrContent = nullptr;
+                    playTransitionVertical(canvas, false);
+                    enterCompanionMode();
+                    break;
+                }
+                if (!WechatBot::isPaired() && ks.enter) {
+                    pairStarted = false;
+                    qrContent = nullptr;
+                }
+            }
+
+            if (!WechatBot::isPaired() && !pairStarted) {
+                qrContent = WechatBot::startPairing();
+                pairStarted = true;
+                lastPollMs = millis();
+            }
+
+            if (WechatBot::getPairState() == WechatBot::PAIR_WAITING
+                && millis() - lastPollMs > 3000) {
+                if (WechatBot::pollPairing()) {
+                    WechatBot::start();
+                    pairStarted = false;
+                    qrContent = nullptr;
+                }
+                lastPollMs = millis();
+            }
+
+            canvas.fillScreen(Color::BG_DAY);
+            canvas.setTextSize(1);
+
+            constexpr int BAR_H = 16;
+            canvas.fillRect(0, 0, SCREEN_W, BAR_H, Color::INPUT_BG);
+            canvas.drawFastHLine(0, BAR_H - 1, SCREEN_W, Color::GROUND_TOP);
+            canvas.setTextColor(Color::STATUS_DIM);
+            canvas.drawString("[Tab]back", 3, 2);
+            if (!WechatBot::isPaired() && WechatBot::getPairState() != WechatBot::PAIR_IDLE) {
+                canvas.drawString("[Enter]retry", SCREEN_W - 78, 2);
+            }
+
+            int cy = BAR_H + 2;
+
+            if (WechatBot::isPaired()) {
+                constexpr int LINES = 5;
+                constexpr int LH = 16;
+                int contentH = LINES * LH;
+                int areaH = SCREEN_H - BAR_H;
+                cy = BAR_H + (areaH - contentH) / 2;
+                int cx = SCREEN_W / 2;
+                canvas.setTextDatum(TC_DATUM);
+
+                canvas.setTextColor(rgb565(60, 200, 80));
+                canvas.fillCircle(cx - 30, cy + 5, 4, rgb565(60, 200, 80));
+                canvas.drawString("Online", cx + 4, cy);
+                cy += LH;
+
+                canvas.setTextColor(Color::CLOCK_TEXT);
+                char cronBuf[24];
+                snprintf(cronBuf, sizeof(cronBuf), "Cron  %d jobs", CronService::getJobCount());
+                canvas.drawString(cronBuf, cx, cy);
+                cy += LH;
+
+                unsigned long hbRemain = Heartbeat::getRemainingMs();
+                int hbMin = hbRemain / 60000;
+                int hbSec = (hbRemain % 60000) / 1000;
+                char hbBuf[24];
+                snprintf(hbBuf, sizeof(hbBuf), "Heartbeat  %02d:%02d", hbMin, hbSec);
+                canvas.drawString(hbBuf, cx, cy);
+                cy += LH;
+
+                canvas.setTextColor(Color::STATUS_DIM);
+                canvas.drawString(WechatBot::getApiHost(), cx, cy);
+                cy += LH;
+                canvas.drawString(WiFi.localIP().toString().c_str(), cx, cy);
+
+                canvas.setTextDatum(TL_DATUM);
+
+            } else if (qrContent && qrContent[0]) {
+                constexpr int QR_SZ = SCREEN_H - BAR_H - 6;
+                constexpr int QR_X = 4;
+                int qrY = BAR_H + 3;
+                canvas.qrcode(qrContent, QR_X, qrY, QR_SZ, 6);
+
+                int tx = QR_X + QR_SZ + 8;
+                int qrMidY = qrY + QR_SZ / 2;
+
+                canvas.setTextColor(Color::CLOCK_TEXT);
+                canvas.drawString("Scan with", tx, qrMidY - 20);
+                canvas.drawString("WeChat", tx, qrMidY - 6);
+
+                canvas.setTextColor(Color::STATUS_DIM);
+                canvas.drawString("Waiting...", tx, qrMidY + 14);
+            } else {
+                canvas.setTextColor(rgb565(200, 80, 60));
+                canvas.drawString("Pairing failed", 70, cy + 10);
+
+                canvas.setTextColor(Color::CLOCK_TEXT);
+                canvas.drawString("Serial:", 30, cy + 34);
+                canvas.setTextColor(rgb565(120, 180, 220));
+                canvas.drawString("set_wechat <tok> <host>", 30, cy + 50);
+            }
+
+            canvas.pushSprite(0, 0);
+            break;
+        }
     }
 
     processSerialCommands();
@@ -614,11 +777,22 @@ static void onAgentResponse(const char* text) {
     agentResponseReady = true;
 }
 
+static void onAgentToken(const char* token) {
+    if (!s_tokenQueue) return;
+    char* copy = strdup(token);
+    if (copy) {
+        s_hasStreamedTokens = true;
+        if (xQueueSend(s_tokenQueue, &copy, 0) != pdTRUE) {
+            free(copy);
+        }
+    }
+}
+
 void startVoiceRecording() {
-    if (FeishuBot::isRunning()) {
-        FeishuBot::stop();
-        s_feishuPausedForVoice = true;
-        Serial.printf("[VOICE] Feishu paused for STT, heap=%d\n", ESP.getFreeHeap());
+    if (WechatBot::isRunning()) {
+        WechatBot::stop();
+        s_wechatPausedForVoice = true;
+        Serial.printf("[VOICE] WeChat paused for STT, heap=%d\n", ESP.getFreeHeap());
     }
 
     M5Cardputer.Speaker.end();
@@ -628,7 +802,7 @@ void startVoiceRecording() {
     }
     if (!sttChunkBuf) {
         Serial.println("[VOICE] Failed to alloc chunk buffer");
-        if (s_feishuPausedForVoice) { FeishuBot::resume(); s_feishuPausedForVoice = false; }
+        if (s_wechatPausedForVoice) { WechatBot::resume(); s_wechatPausedForVoice = false; }
         return;
     }
 
@@ -651,7 +825,7 @@ void startVoiceRecording() {
         Serial.println("[VOICE] STT stream failed");
         M5Cardputer.Mic.end();
         free(sttChunkBuf); sttChunkBuf = nullptr;
-        if (s_feishuPausedForVoice) { FeishuBot::resume(); s_feishuPausedForVoice = false; }
+        if (s_wechatPausedForVoice) { WechatBot::resume(); s_wechatPausedForVoice = false; }
         return;
     }
 
@@ -689,10 +863,10 @@ String stopVoiceRecording() {
     free(sttChunkBuf);
     sttChunkBuf = nullptr;
 
-    if (s_feishuPausedForVoice) {
-        FeishuBot::resume();
-        s_feishuPausedForVoice = false;
-        Serial.printf("[VOICE] Feishu resumed, heap=%d\n", ESP.getFreeHeap());
+    if (s_wechatPausedForVoice) {
+        WechatBot::resume();
+        s_wechatPausedForVoice = false;
+        Serial.printf("[VOICE] WeChat resumed, heap=%d\n", ESP.getFreeHeap());
     }
 
     float duration = (float)(millis() - recordingStartMs) / 1000.0f;
@@ -955,8 +1129,8 @@ void initOnlineServices() {
     weatherClient.begin(Config::getCity());
     Agent::start();
 
-    // Start Feishu bot (lazy: only if credentials configured)
-    FeishuBot::start();
+    // Start WeChat bot (lazy: only if credentials configured)
+    WechatBot::start();
 
     // Start background services
     CronService::start();

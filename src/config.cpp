@@ -5,7 +5,7 @@ static Preferences prefs;
 static String ssid, password, ssid2, password2, city;
 static String llmApiKey, llmModel, llmProvider, llmHost, llmPath;
 static String dashScopeKey, glmSearchKey;
-static String feishuAppId, feishuAppSecret;
+static String wechatToken, wechatApiHost;
 
 bool Config::load() {
     prefs.begin("m5claw", true);
@@ -21,8 +21,8 @@ bool Config::load() {
     llmPath         = prefs.getString("llm_path", "");
     dashScopeKey    = prefs.getString("ds_key", "");
     glmSearchKey    = prefs.getString("glm_key", "");
-    feishuAppId     = prefs.getString("fs_appid", "");
-    feishuAppSecret = prefs.getString("fs_secret", "");
+    wechatToken     = prefs.getString("wc_token", "");
+    wechatApiHost   = prefs.getString("wc_host", "");
     prefs.end();
     return ssid.length() > 0;
 }
@@ -41,8 +41,8 @@ void Config::save() {
     prefs.putString("llm_path",  llmPath);
     prefs.putString("ds_key",    dashScopeKey);
     prefs.putString("glm_key",   glmSearchKey);
-    prefs.putString("fs_appid",  feishuAppId);
-    prefs.putString("fs_secret", feishuAppSecret);
+    prefs.putString("wc_token",  wechatToken);
+    prefs.putString("wc_host",   wechatApiHost);
     prefs.end();
 }
 
@@ -53,7 +53,7 @@ void Config::reset() {
     ssid = password = ssid2 = password2 = city = "";
     llmApiKey = llmModel = llmProvider = llmHost = llmPath = "";
     dashScopeKey = glmSearchKey = "";
-    feishuAppId = feishuAppSecret = "";
+    wechatToken = wechatApiHost = "";
 }
 
 const String& Config::getSSID()            { return ssid; }
@@ -68,8 +68,8 @@ const String& Config::getLlmHost()         { return llmHost; }
 const String& Config::getLlmPath()         { return llmPath; }
 const String& Config::getDashScopeKey()    { return dashScopeKey; }
 const String& Config::getGlmSearchKey()    { return glmSearchKey; }
-const String& Config::getFeishuAppId()     { return feishuAppId; }
-const String& Config::getFeishuAppSecret() { return feishuAppSecret; }
+const String& Config::getWechatToken()     { return wechatToken; }
+const String& Config::getWechatApiHost()   { return wechatApiHost; }
 
 void Config::setSSID(const String& s)            { ssid = s; }
 void Config::setPassword(const String& p)        { password = p; }
@@ -83,7 +83,7 @@ void Config::setLlmHost(const String& h)         { llmHost = h; }
 void Config::setLlmPath(const String& p)         { llmPath = p; }
 void Config::setDashScopeKey(const String& k)    { dashScopeKey = k; }
 void Config::setGlmSearchKey(const String& k)    { glmSearchKey = k; }
-void Config::setFeishuAppId(const String& id)    { feishuAppId = id; }
-void Config::setFeishuAppSecret(const String& s) { feishuAppSecret = s; }
+void Config::setWechatToken(const String& t)     { wechatToken = t; }
+void Config::setWechatApiHost(const String& h)   { wechatApiHost = h; }
 
 bool Config::isValid() { return ssid.length() > 0 && llmApiKey.length() > 0; }

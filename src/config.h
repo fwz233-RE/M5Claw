@@ -25,9 +25,9 @@ namespace Config {
     // Search
     const String& getGlmSearchKey();
 
-    // Feishu
-    const String& getFeishuAppId();
-    const String& getFeishuAppSecret();
+    // WeChat
+    const String& getWechatToken();
+    const String& getWechatApiHost();
 
     void setSSID(const String& ssid);
     void setPassword(const String& password);
@@ -41,8 +41,8 @@ namespace Config {
     void setLlmPath(const String& path);
     void setDashScopeKey(const String& key);
     void setGlmSearchKey(const String& key);
-    void setFeishuAppId(const String& id);
-    void setFeishuAppSecret(const String& secret);
+    void setWechatToken(const String& token);
+    void setWechatApiHost(const String& host);
 
     bool isValid();
 }

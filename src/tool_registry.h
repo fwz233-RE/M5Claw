@@ -14,5 +14,8 @@ namespace ToolRegistry {
     void init();
     const char* getToolsJson();
     bool execute(const char* name, const char* input, char* output, size_t output_size);
+    void setRequestContext(const char* channel, const char* chatId);
+    const char* getCtxChannel();
+    const char* getCtxChatId();
 }
 

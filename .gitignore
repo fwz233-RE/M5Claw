@@ -29,7 +29,6 @@ spiffs.bin
 .DS_Store
 Thumbs.db
 desktop.
-gen_sprites.py
 
 # 临时文件
 *.tmp

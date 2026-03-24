@@ -4,9 +4,10 @@
 #include "context_builder.h"
 #include "session_mgr.h"
 #include "message_bus.h"
-#include "feishu_bot.h"
+#include "wechat_bot.h"
 #include "m5claw_config.h"
 #include <ArduinoJson.h>
+#include <SPIFFS.h>
 #include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -19,6 +20,7 @@ struct AgentRequest {
     char msgId[64];
     AgentResponseCallback callback;
     AgentResponseExCallback exCallback;
+    AgentTokenCallback tokenCallback;
 };
 
 static QueueHandle_t s_queue = nullptr;
@@ -32,15 +34,57 @@ static char* s_extConvAI = nullptr;
 static char s_extConvChannel[16] = {0};
 
 static JsonDocument** s_freeable_messages = nullptr;
+static AgentTokenCallback s_activeTokenCb = nullptr;
 
-static void preReadFree() {
+static void* alloc_prefer_psram(size_t size) {
+    void* p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) p = heap_caps_malloc(size, MALLOC_CAP_8BIT);
+    return p;
+}
+
+static void* calloc_prefer_psram(size_t count, size_t size) {
+    void* p = heap_caps_calloc(count, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) p = heap_caps_calloc(count, size, MALLOC_CAP_8BIT);
+    return p;
+}
+
+static void llmStreamForwarder(const char* token) {
+    if (s_activeTokenCb) s_activeTokenCb(token);
+}
+
+static void preSwapToSPIFFS() {
     if (s_freeable_messages && *s_freeable_messages) {
         JsonDocument* doc = *s_freeable_messages;
+        File f = SPIFFS.open(M5CLAW_AGENT_SWAP_FILE, "w");
+        if (f) {
+            serializeJson(*doc, f);
+            f.close();
+        }
         doc->~JsonDocument();
         heap_caps_free(doc);
         *s_freeable_messages = nullptr;
-        Serial.printf("[AGENT] Freed messages for LLM buffer, heap=%d\n", ESP.getFreeHeap());
+        Serial.printf("[AGENT] Swapped messages to SPIFFS, heap=%d\n", ESP.getFreeHeap());
     }
+}
+
+static bool restoreMessagesFromSwap(JsonDocument** messagesPtr) {
+    File f = SPIFFS.open(M5CLAW_AGENT_SWAP_FILE, "r");
+    if (!f) return false;
+    void* mem = alloc_prefer_psram(sizeof(JsonDocument));
+    JsonDocument* doc = mem ? new (mem) JsonDocument : nullptr;
+    if (!doc) { f.close(); return false; }
+    DeserializationError err = deserializeJson(*doc, f);
+    f.close();
+    SPIFFS.remove(M5CLAW_AGENT_SWAP_FILE);
+    if (err) {
+        Serial.printf("[AGENT] Swap file parse error: %s\n", err.c_str());
+        doc->~JsonDocument();
+        heap_caps_free(doc);
+        return false;
+    }
+    *messagesPtr = doc;
+    Serial.printf("[AGENT] Restored messages from SPIFFS, heap=%d\n", ESP.getFreeHeap());
+    return true;
 }
 
 static char* stripMarkdownBold(const char* text) {
@@ -63,18 +107,6 @@ static char* stripMarkdownBold(const char* text) {
 }
 
 #define TOOL_OUTPUT_SIZE (8 * 1024)
-
-static void* alloc_prefer_psram(size_t size) {
-    void* p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!p) p = heap_caps_malloc(size, MALLOC_CAP_8BIT);
-    return p;
-}
-
-static void* calloc_prefer_psram(size_t count, size_t size) {
-    void* p = heap_caps_calloc(count, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!p) p = heap_caps_calloc(count, size, MALLOC_CAP_8BIT);
-    return p;
-}
 
 static void processRequest(AgentRequest& req, char* system_prompt, char* tool_output) {
     Serial.printf("[AGENT] Processing (ch=%s): %.200s\n", req.channel, req.text);
@@ -140,31 +172,34 @@ static void processRequest(AgentRequest& req, char* system_prompt, char* tool_ou
                          "\xe9\x87\x8d\xe8\xaf\x95\xe4\xb8\xad... (%d/10)", retryCount);
                 Serial.printf("[AGENT] %s\n", retryMsg);
                 if (req.callback) req.callback(retryMsg);
-                if (strcmp(req.channel, M5CLAW_CHAN_FEISHU) == 0 && req.chatId[0]) {
-                    FeishuBot::sendMessage(req.chatId, retryMsg);
-                }
+                
                 delay(2000);
             }
 
             if (messages == nullptr) {
-                void* newMem = alloc_prefer_psram(sizeof(JsonDocument));
-                messages = newMem ? new (newMem) JsonDocument : nullptr;
-                if (!messages) {
-                    Serial.println("[AGENT] OOM reconstructing messages for retry");
-                    break;
+                if (!restoreMessagesFromSwap(&messages)) {
+                    void* newMem = alloc_prefer_psram(sizeof(JsonDocument));
+                    messages = newMem ? new (newMem) JsonDocument : nullptr;
+                    if (!messages) {
+                        Serial.println("[AGENT] OOM reconstructing messages for retry");
+                        break;
+                    }
+                    String freshHist = SessionMgr::getHistoryJson(sessionId, M5CLAW_AGENT_MAX_HISTORY);
+                    deserializeJson(*messages, freshHist);
+                    JsonObject rebuiltUser = messages->as<JsonArray>().add<JsonObject>();
+                    rebuiltUser["role"] = "user";
+                    rebuiltUser["content"] = req.text;
                 }
-                String freshHist = SessionMgr::getHistoryJson(sessionId, M5CLAW_AGENT_MAX_HISTORY);
-                deserializeJson(*messages, freshHist);
-                JsonObject rebuiltUser = messages->as<JsonArray>().add<JsonObject>();
-                rebuiltUser["role"] = "user";
-                rebuiltUser["content"] = req.text;
             }
 
             const char* iter_tools = (iteration >= M5CLAW_AGENT_MAX_TOOL_ITER - 2)
                                      ? nullptr : tools_json;
             s_freeable_messages = &messages;
-            llm_client_set_pre_read_free(preReadFree);
-            ok = llm_chat_tools(system_prompt, *messages, iter_tools, &resp);
+            llm_client_set_pre_read_free(preSwapToSPIFFS);
+            s_activeTokenCb = req.tokenCallback;
+            ok = llm_chat_tools(system_prompt, *messages, iter_tools, &resp,
+                                req.tokenCallback ? llmStreamForwarder : nullptr);
+            s_activeTokenCb = nullptr;
             llm_client_set_pre_read_free(nullptr);
             s_freeable_messages = nullptr;
 
@@ -199,19 +234,29 @@ static void processRequest(AgentRequest& req, char* system_prompt, char* tool_ou
 
         Serial.printf("[AGENT] Tool iteration %d: %d calls\n", iteration + 1, resp.call_count);
 
-        if (messages == nullptr) {
-            void* newMem = alloc_prefer_psram(sizeof(JsonDocument));
-            messages = newMem ? new (newMem) JsonDocument : nullptr;
-            if (!messages) {
-                Serial.println("[AGENT] OOM reconstructing messages for tool iteration");
-                llm_response_free(&resp);
-                break;
+        if (req.tokenCallback) {
+            for (int i = 0; i < resp.call_count; i++) {
+                char status[64];
+                snprintf(status, sizeof(status), "\n[tool: %s]\n", resp.calls[i].name);
+                req.tokenCallback(status);
             }
-            String freshHist = SessionMgr::getHistoryJson(sessionId, M5CLAW_AGENT_MAX_HISTORY);
-            deserializeJson(*messages, freshHist);
-            JsonObject rebuiltUser = messages->as<JsonArray>().add<JsonObject>();
-            rebuiltUser["role"] = "user";
-            rebuiltUser["content"] = req.text;
+        }
+
+        if (messages == nullptr) {
+            if (!restoreMessagesFromSwap(&messages)) {
+                void* newMem = alloc_prefer_psram(sizeof(JsonDocument));
+                messages = newMem ? new (newMem) JsonDocument : nullptr;
+                if (!messages) {
+                    Serial.println("[AGENT] OOM reconstructing messages for tool iteration");
+                    llm_response_free(&resp);
+                    break;
+                }
+                String freshHist = SessionMgr::getHistoryJson(sessionId, M5CLAW_AGENT_MAX_HISTORY);
+                deserializeJson(*messages, freshHist);
+                JsonObject rebuiltUser = messages->as<JsonArray>().add<JsonObject>();
+                rebuiltUser["role"] = "user";
+                rebuiltUser["content"] = req.text;
+            }
         }
 
         JsonObject asstMsg = messages->as<JsonArray>().add<JsonObject>();
@@ -281,6 +326,7 @@ static void processRequest(AgentRequest& req, char* system_prompt, char* tool_ou
         messages->~JsonDocument();
         heap_caps_free(messages);
     }
+    SPIFFS.remove(M5CLAW_AGENT_SWAP_FILE);
 
     bool wasAborted = s_abortRequested;
     if (wasAborted) {
@@ -303,7 +349,8 @@ static void processRequest(AgentRequest& req, char* system_prompt, char* tool_ou
         req.exCallback(&info);
     }
 
-    if (strcmp(req.channel, M5CLAW_CHAN_LOCAL) != 0) {
+    bool fromBus = (req.callback == nullptr);
+    if (fromBus || strcmp(req.channel, M5CLAW_CHAN_LOCAL) != 0) {
         free(s_extConvUser);
         free(s_extConvAI);
         s_extConvUser = strdup(req.text);
@@ -318,19 +365,11 @@ static void processRequest(AgentRequest& req, char* system_prompt, char* tool_ou
 static void busResponseHandler(const AgentResponseInfo* info) {
     if (strcmp(info->channel, M5CLAW_CHAN_LOCAL) == 0) return;
 
-    if (strcmp(info->channel, M5CLAW_CHAN_FEISHU) == 0) {
+    if (strcmp(info->channel, M5CLAW_CHAN_WECHAT) == 0) {
         char* cleaned = stripMarkdownBold(info->text);
-        FeishuBot::sendMessage(info->chatId, cleaned ? cleaned : info->text);
+        WechatBot::sendMessage(info->chatId, cleaned ? cleaned : info->text);
         free(cleaned);
         return;
-    }
-
-    BusMessage outMsg = {};
-    strlcpy(outMsg.channel, info->channel, sizeof(outMsg.channel));
-    strlcpy(outMsg.chat_id, info->chatId, sizeof(outMsg.chat_id));
-    outMsg.content = strdup(info->text);
-    if (outMsg.content) {
-        if (!MessageBus::pushOutbound(&outMsg)) free(outMsg.content);
     }
 }
 
@@ -363,7 +402,7 @@ static void agent_task(void* arg) {
         if (xQueueReceive(s_queue, &req, pdMS_TO_TICKS(100)) == pdTRUE) {
             hasReq = true;
         } else {
-            // Check message bus (feishu, cron, heartbeat)
+            // Check message bus (wechat, cron, heartbeat)
             BusMessage busMsg;
             if (MessageBus::popInbound(&busMsg, 100)) {
                 memset(&req, 0, sizeof(req));
@@ -382,28 +421,54 @@ static void agent_task(void* arg) {
         s_busy = true;
         s_abortRequested = false;
 
-        bool feishuWasActive = FeishuBot::isRunning();
-        if (feishuWasActive) {
-            FeishuBot::stop();
-            Serial.printf("[AGENT] Feishu paused, heap=%d\n", ESP.getFreeHeap());
+        bool isCronNotify = (req.text && strncmp(req.text, "[Cron:", 6) == 0);
+        if (isCronNotify && req.callback == nullptr) {
+            Serial.printf("[AGENT] Cron notify (ch=%s): %.80s\n", req.channel, req.text);
+
+            if (strcmp(req.channel, M5CLAW_CHAN_WECHAT) == 0 && req.chatId[0]) {
+                bool wxa = WechatBot::isRunning();
+                if (wxa) WechatBot::stop();
+                char* cleaned = stripMarkdownBold(req.text);
+                WechatBot::sendMessage(req.chatId, cleaned ? cleaned : req.text);
+                free(cleaned);
+                if (wxa) WechatBot::resume();
+            }
+
+            free(s_extConvUser);
+            free(s_extConvAI);
+            s_extConvUser = nullptr;
+            s_extConvAI = strdup(req.text);
+            strlcpy(s_extConvChannel, req.channel, sizeof(s_extConvChannel));
+            s_extConvReady = true;
+
+            free(req.text);
+            s_busy = false;
+            continue;
         }
 
-        char reactionId[128] = {0};
-        bool isFeishu = strcmp(req.channel, M5CLAW_CHAN_FEISHU) == 0;
-        if (isFeishu && req.msgId[0]) {
-            FeishuBot::addReaction(req.msgId, nullptr, reactionId, sizeof(reactionId));
+        bool wechatWasActive = WechatBot::isRunning();
+        if (wechatWasActive) {
+            WechatBot::stop();
+            Serial.printf("[AGENT] WeChat paused, heap=%d\n", ESP.getFreeHeap());
+        }
+
+        ToolRegistry::setRequestContext(req.channel, req.chatId);
+
+        bool isWechat = strcmp(req.channel, M5CLAW_CHAN_WECHAT) == 0;
+        if (isWechat && req.chatId[0]) {
+            WechatBot::sendTyping(req.chatId, 1);
         }
 
         processRequest(req, system_prompt, tool_output);
 
-        if (isFeishu && reactionId[0] && req.msgId[0]) {
-            FeishuBot::removeReaction(req.msgId, reactionId);
+        if (isWechat && req.chatId[0]) {
+            WechatBot::sendTyping(req.chatId, 2);
         }
 
         free(req.text);
 
-        if (feishuWasActive) {
-            FeishuBot::resume();
+        if (wechatWasActive) {
+            WechatBot::resume();
         }
 
         s_busy = false;
@@ -425,7 +490,8 @@ void Agent::start() {
     Serial.println("[AGENT] Started");
 }
 
-void Agent::sendMessage(const char* text, AgentResponseCallback onResponse) {
+void Agent::sendMessage(const char* text, AgentResponseCallback onResponse,
+                        AgentTokenCallback onToken) {
     if (!s_ready) {
         if (onResponse) onResponse("Agent unavailable: memory init failed.");
         return;
@@ -437,6 +503,7 @@ void Agent::sendMessage(const char* text, AgentResponseCallback onResponse) {
     strlcpy(req.chatId, "local", sizeof(req.chatId));
     req.callback = onResponse;
     req.exCallback = nullptr;
+    req.tokenCallback = onToken;
     if (!req.text || xQueueSend(s_queue, &req, 0) != pdTRUE) {
         free(req.text);
         if (onResponse) onResponse("Agent queue full, try again.");

@@ -64,7 +64,11 @@ void Chat::update(M5Canvas& canvas) {
     canvas.setFont(&fonts::efontCN_12);
     canvas.setTextSize(1);
 
+    canvas.fillRect(0, 0, SCREEN_W, MSG_AREA_Y, Color::INPUT_BG);
     canvas.drawFastHLine(0, MSG_AREA_Y - 1, SCREEN_W, Color::GROUND_TOP);
+    canvas.setTextColor(Color::STATUS_DIM);
+    canvas.drawString("[Alt]back [Tab/Ctrl]scroll", 3, 2);
+    canvas.drawString("[Fn]voice", SCREEN_W - 56, 2);
 
     drawMessages(canvas);
     drawInputBar(canvas);

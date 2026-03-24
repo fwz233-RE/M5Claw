@@ -38,8 +38,8 @@ void ContextBuilder::buildSystemPrompt(char* buf, size_t bufSize) {
         "- cron_add: Schedule a recurring (every) or one-shot (at) task.\n"
         "- cron_list: List all scheduled cron jobs.\n"
         "- cron_remove: Remove a cron job by ID.\n"
-        "- feishu_send: Send a message to a Feishu chat proactively.\n\n"
-        "For cron with Feishu delivery, set channel='feishu' and a valid chat_id.\n\n");
+        "- wechat_send: Send a message to a WeChat user proactively.\n\n"
+        "For cron with WeChat delivery, set channel='wechat' and a valid chat_id.\n\n");
 
     // Memory
     off += snprintf(buf + off, bufSize - off,
@@ -74,7 +74,7 @@ void ContextBuilder::buildSystemPrompt(char* buf, size_t bufSize) {
     off += snprintf(buf + off, bufSize - off,
         "## Channels\n"
         "- local: M5Cardputer screen + keyboard + voice. Keep replies short.\n"
-        "- feishu: Feishu messenger. Longer replies OK. Use feishu_send to push messages.\n"
+        "- wechat: WeChat messenger. Longer replies OK. Use wechat_send to push messages.\n"
         "- system: Internal triggers (cron, heartbeat). Route response to appropriate channel.\n\n"
         "Respond in the user's language (Chinese or English).\n"
         "Use tools when needed. Provide final answer as text after tool use.\n");

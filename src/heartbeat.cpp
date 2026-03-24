@@ -6,6 +6,7 @@
 #include <freertos/timers.h>
 
 static TimerHandle_t s_timer = nullptr;
+static unsigned long s_lastTickMs = 0;
 
 static bool hasActionableContent(const char* text) {
     if (!text || !text[0]) return false;
@@ -22,6 +23,7 @@ static bool hasActionableContent(const char* text) {
 
 static void heartbeatCheck(TimerHandle_t timer) {
     (void)timer;
+    s_lastTickMs = millis();
     String content = MemoryStore::readFile(M5CLAW_HEARTBEAT_FILE);
     if (content.length() == 0 || !hasActionableContent(content.c_str())) return;
 
@@ -49,6 +51,7 @@ void Heartbeat::init() {
 
 void Heartbeat::start() {
     if (s_timer) return;
+    s_lastTickMs = millis();
     s_timer = xTimerCreate("hb", pdMS_TO_TICKS(M5CLAW_HEARTBEAT_INTERVAL_MS),
                            pdTRUE, nullptr, heartbeatCheck);
     if (s_timer) {
@@ -56,5 +59,12 @@ void Heartbeat::start() {
         Serial.printf("[HEARTBEAT] Timer started (%d min interval)\n",
                       M5CLAW_HEARTBEAT_INTERVAL_MS / 60000);
     }
+}
+
+unsigned long Heartbeat::getRemainingMs() {
+    if (!s_timer) return 0;
+    unsigned long elapsed = millis() - s_lastTickMs;
+    if (elapsed >= M5CLAW_HEARTBEAT_INTERVAL_MS) return 0;
+    return M5CLAW_HEARTBEAT_INTERVAL_MS - elapsed;
 }
 

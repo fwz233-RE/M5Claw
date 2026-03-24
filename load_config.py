@@ -19,8 +19,8 @@ else:
         "llm_path":         "USER_LLM_PATH",
         "dashscope_key":    "USER_DS_KEY",
         "city":             "USER_CITY",
-        "feishu_app_id":    "USER_FEISHU_APP_ID",
-        "feishu_app_secret":"USER_FEISHU_APP_SECRET",
+        "wechat_token":     "USER_WECHAT_TOKEN",
+        "wechat_api_host":  "USER_WECHAT_API_HOST",
         "glm_search_key":   "USER_GLM_SEARCH_KEY",
     }
 

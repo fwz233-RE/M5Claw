@@ -3,7 +3,7 @@
 #include "m5claw_config.h"
 #include "config.h"
 #include "cron_service.h"
-#include "feishu_bot.h"
+#include "wechat_bot.h"
 #include <ArduinoJson.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -347,8 +347,11 @@ static bool tool_cron_add(const char* input, char* output, size_t sz) {
     const char* name = doc["name"] | "";
     const char* schedType = doc["schedule_type"] | "every";
     const char* message = doc["message"] | "";
-    const char* channel = doc["channel"] | M5CLAW_CHAN_LOCAL;
-    const char* chatId = doc["chat_id"] | "cron";
+
+    const char* ctxCh = ToolRegistry::getCtxChannel();
+    const char* ctxId = ToolRegistry::getCtxChatId();
+    const char* channel = ctxCh[0] ? ctxCh : M5CLAW_CHAN_LOCAL;
+    const char* chatId  = ctxId[0] ? ctxId : "cron";
 
     if (!name[0] || !message[0]) { strlcpy(output, "Missing name or message", sz); return false; }
 
@@ -366,6 +369,7 @@ static bool tool_cron_add(const char* input, char* output, size_t sz) {
     } else {
         job.kind = CRON_KIND_EVERY;
         job.intervalSec = doc["interval_s"] | 3600;
+        job.deleteAfterRun = false;
     }
 
     if (CronService::addJob(&job)) {
@@ -414,18 +418,18 @@ static bool tool_cron_remove(const char* input, char* output, size_t sz) {
     return true;
 }
 
-/* ── feishu_send (AI-initiated message push) ───────── */
-static bool tool_feishu_send(const char* input, char* output, size_t sz) {
+/* ── wechat_send (AI-initiated message push) ───────── */
+static bool tool_wechat_send(const char* input, char* output, size_t sz) {
     JsonDocument doc;
     if (deserializeJson(doc, input)) { strlcpy(output, "Invalid JSON", sz); return false; }
     const char* chatId = doc["chat_id"] | "";
     const char* text = doc["text"] | "";
     if (!chatId[0] || !text[0]) { strlcpy(output, "Missing chat_id or text", sz); return false; }
 
-    if (FeishuBot::sendMessage(chatId, text)) {
-        snprintf(output, sz, "Sent to Feishu %s", chatId);
+    if (WechatBot::sendMessage(chatId, text)) {
+        snprintf(output, sz, "Sent to WeChat %s", chatId);
     } else {
-        strlcpy(output, "Failed to send Feishu message (not configured or network error)", sz);
+        strlcpy(output, "Failed to send WeChat message (not configured or network error)", sz);
     }
     return true;
 }
@@ -470,8 +474,8 @@ static const ToolDef s_tools[] = {
     },
     {
         "cron_add",
-        "Schedule a recurring or one-shot task",
-        "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"Job name\"},\"schedule_type\":{\"type\":\"string\",\"description\":\"'every' for recurring or 'at' for one-shot\"},\"interval_s\":{\"type\":\"integer\",\"description\":\"Interval in seconds (for every)\"},\"at_epoch\":{\"type\":\"integer\",\"description\":\"Unix timestamp (for at)\"},\"message\":{\"type\":\"string\",\"description\":\"Message to trigger when job fires\"},\"channel\":{\"type\":\"string\",\"description\":\"Reply channel: local or feishu\"},\"chat_id\":{\"type\":\"string\",\"description\":\"Chat ID for reply routing\"}},\"required\":[\"name\",\"message\"]}",
+        "Schedule a recurring or one-shot task. Notification is automatically sent to the channel where this request originated.",
+        "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"Job name\"},\"schedule_type\":{\"type\":\"string\",\"description\":\"'every' for recurring or 'at' for one-shot\"},\"interval_s\":{\"type\":\"integer\",\"description\":\"Interval in seconds (for every)\"},\"at_epoch\":{\"type\":\"integer\",\"description\":\"Unix timestamp (for at)\"},\"message\":{\"type\":\"string\",\"description\":\"Message to trigger when job fires\"}},\"required\":[\"name\",\"message\"]}",
         tool_cron_add
     },
     {
@@ -487,15 +491,17 @@ static const ToolDef s_tools[] = {
         tool_cron_remove
     },
     {
-        "feishu_send",
-        "Send a message to a Feishu chat proactively",
-        "{\"type\":\"object\",\"properties\":{\"chat_id\":{\"type\":\"string\",\"description\":\"Feishu open_id or chat_id\"},\"text\":{\"type\":\"string\",\"description\":\"Message text\"}},\"required\":[\"chat_id\",\"text\"]}",
-        tool_feishu_send
+        "wechat_send",
+        "Send a message to a WeChat user proactively",
+        "{\"type\":\"object\",\"properties\":{\"chat_id\":{\"type\":\"string\",\"description\":\"WeChat user_id\"},\"text\":{\"type\":\"string\",\"description\":\"Message text\"}},\"required\":[\"chat_id\",\"text\"]}",
+        tool_wechat_send
     },
 };
 
 static const int TOOL_COUNT = sizeof(s_tools) / sizeof(s_tools[0]);
 static char* s_tools_json = nullptr;
+static char s_ctx_channel[16] = {0};
+static char s_ctx_chatId[96] = {0};
 
 void ToolRegistry::init() {
     JsonDocument doc;
@@ -526,3 +532,10 @@ bool ToolRegistry::execute(const char* name, const char* input, char* output, si
     snprintf(output, output_size, "Unknown tool: %s", name);
     return false;
 }
+
+void ToolRegistry::setRequestContext(const char* channel, const char* chatId) {
+    strlcpy(s_ctx_channel, channel ? channel : "", sizeof(s_ctx_channel));
+    strlcpy(s_ctx_chatId, chatId ? chatId : "", sizeof(s_ctx_chatId));
+}
+const char* ToolRegistry::getCtxChannel() { return s_ctx_channel; }
+const char* ToolRegistry::getCtxChatId()  { return s_ctx_chatId; }

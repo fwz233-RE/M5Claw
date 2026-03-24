@@ -29,7 +29,10 @@ void llm_client_set_abort_flag(volatile bool* flag);
 typedef void (*LlmPreReadFreeFn)();
 void llm_client_set_pre_read_free(LlmPreReadFreeFn fn);
 
+typedef void (*LlmStreamCallback)(const char* token);
+
 bool llm_chat_tools(const char* system_prompt,
                     JsonDocument& messages,
                     const char* tools_json,
-                    LlmResponse* resp);
+                    LlmResponse* resp,
+                    LlmStreamCallback on_token = nullptr);

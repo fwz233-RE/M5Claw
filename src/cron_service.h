@@ -25,4 +25,5 @@ namespace CronService {
     bool addJob(CronJob* job);
     bool removeJob(const char* jobId);
     void listJobs(const CronJob** jobs, int* count);
+    int getJobCount();
 }

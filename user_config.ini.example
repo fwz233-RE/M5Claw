@@ -27,3 +27,9 @@ dashscope_key =
 
 ; 天气城市（选填，英文）
 city = Beijing
+
+; WeChat Bot 配置（选填）
+; 通过 npx -y @tencent-weixin/openclaw-weixin-cli@latest install 获取凭证
+; 或在设备串口执行 set_wechat <token> <api_host>
+wechat_token =
+wechat_api_host =

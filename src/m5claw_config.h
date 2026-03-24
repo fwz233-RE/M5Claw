@@ -18,6 +18,11 @@
 #define M5CLAW_LLM_OPENAI_PATH         "/v1/chat/completions"
 #define M5CLAW_LLM_API_VERSION         "2023-06-01"
 #define M5CLAW_LLM_RESPONSE_BUF        (4 * 1024)
+#define M5CLAW_SSE_LINE_BUF            1024
+#define M5CLAW_LLM_TEXT_MAX            (8 * 1024)
+
+// Agent SPIFFS swap
+#define M5CLAW_AGENT_SWAP_FILE         "/tmp_msgs.json"
 
 // Memory / SPIFFS  (SPIFFS.open() auto-prepends mount point "/spiffs")
 #define M5CLAW_SOUL_FILE               "/config/SOUL.md"
@@ -28,13 +33,19 @@
 #define M5CLAW_CONTEXT_BUF_SIZE        (4 * 1024)
 #define M5CLAW_SESSION_MAX_MSGS        10
 
-// Feishu Bot
-#define M5CLAW_FEISHU_TASK_STACK       (16 * 1024)
-#define M5CLAW_FEISHU_TASK_PRIO        5
-#define M5CLAW_FEISHU_TASK_CORE        0
-#define M5CLAW_FEISHU_MAX_MSG_LEN      2048
-#define M5CLAW_FEISHU_API_BASE         "open.feishu.cn"
-#define M5CLAW_FEISHU_DEDUP_SIZE       64
+// WeChat Bot (iLink protocol)
+#define M5CLAW_WECHAT_TASK_STACK       (10 * 1024)
+#define M5CLAW_WECHAT_TASK_PRIO        5
+#define M5CLAW_WECHAT_TASK_CORE        0
+#define M5CLAW_WECHAT_MAX_MSG_LEN      2048
+#define M5CLAW_WECHAT_DEDUP_SIZE       64
+#define M5CLAW_WECHAT_DEFAULT_HOST     "ilinkai.weixin.qq.com"
+#define M5CLAW_WECHAT_API_GETUPDATES   "/ilink/bot/getupdates"
+#define M5CLAW_WECHAT_API_SENDMSG      "/ilink/bot/sendmessage"
+#define M5CLAW_WECHAT_API_TYPING       "/ilink/bot/sendtyping"
+#define M5CLAW_WECHAT_API_CONFIG       "/ilink/bot/getconfig"
+#define M5CLAW_WECHAT_QR_PATH          "/ilink/bot/get_bot_qrcode?bot_type=3"
+#define M5CLAW_WECHAT_QR_STATUS_PATH   "/ilink/bot/get_qrcode_status?qrcode="
 
 // GLM Web Search (Zhipu AI)
 #define M5CLAW_SEARCH_HOST             "open.bigmodel.cn"
@@ -59,7 +70,7 @@
 
 // Channel identifiers
 #define M5CLAW_CHAN_LOCAL               "local"
-#define M5CLAW_CHAN_FEISHU              "feishu"
+#define M5CLAW_CHAN_WECHAT             "wechat"
 #define M5CLAW_CHAN_SYSTEM              "system"
 
 // DashScope STT

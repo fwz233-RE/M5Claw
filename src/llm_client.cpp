@@ -37,10 +37,6 @@ static const char* llm_path() {
     return provider_is_openai() ? M5CLAW_LLM_OPENAI_PATH : M5CLAW_LLM_ANTHROPIC_PATH;
 }
 
-static bool provider_is_minimax_compatible() {
-    return strstr(llm_host(), "minimax") != nullptr;
-}
-
 static bool resolve_host(const char* host, IPAddress& ip, const char* tag) {
     if (WiFi.status() != WL_CONNECTED) {
         Serial.printf("%s WiFi not connected\n", tag);
@@ -78,12 +74,6 @@ static void* alloc_prefer_psram(size_t size) {
     return p;
 }
 
-static void* calloc_prefer_psram(size_t count, size_t size) {
-    void* p = heap_caps_calloc(count, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!p) p = heap_caps_calloc(count, size, MALLOC_CAP_8BIT);
-    return p;
-}
-
 void llm_client_init(const char* api_key, const char* model, const char* provider,
                      const char* custom_host, const char* custom_path) {
     if (api_key && api_key[0]) safe_copy(s_api_key, sizeof(s_api_key), api_key);
@@ -109,83 +99,152 @@ void llm_response_free(LlmResponse* resp) {
     resp->tool_use = false;
 }
 
-static bool skip_http_headers(WiFiClientSecure& client) {
+// ── HTTP header parser with chunked encoding detection ────────
+
+static bool skip_http_headers(WiFiClientSecure& client, bool* out_chunked) {
+    *out_chunked = false;
+    char hdr[128];
+    int hp = 0;
     int state = 0;
     while (client.connected()) {
         if (is_aborted()) return false;
         if (!client.available()) { delay(10); continue; }
         char c = client.read();
+        if (c != '\r' && c != '\n' && hp < 126) hdr[hp++] = c;
         switch (state) {
             case 0: state = (c == '\r') ? 1 : (c == '\n') ? 2 : 0; break;
             case 1: state = (c == '\n') ? 2 : (c == '\r') ? 1 : 0; break;
             case 2: if (c == '\n') return true; state = (c == '\r') ? 3 : 0; break;
             case 3: if (c == '\n') return true; state = 0; break;
         }
+        if (c == '\n') {
+            hdr[hp] = '\0';
+            if (strncasecmp(hdr, "transfer-encoding:", 18) == 0) {
+                const char* v = hdr + 18;
+                while (*v == ' ') v++;
+                if (strncasecmp(v, "chunked", 7) == 0) *out_chunked = true;
+            }
+            hp = 0;
+        }
     }
     return false;
 }
 
-static int read_http_body(WiFiClientSecure& client, char* buf, int bufSize) {
-    int len = 0;
-    while (len < bufSize - 1) {
-        if (is_aborted()) break;
-        if (client.available()) {
-            buf[len++] = client.read();
-        } else if (!client.connected()) {
-            break;
-        } else {
+// ── Chunked transfer encoding reader ──────────────────────────
+
+struct ChunkedReader {
+    WiFiClientSecure& client;
+    bool chunked;
+    int remaining;
+    bool eof;
+
+    ChunkedReader(WiFiClientSecure& c, bool isChunked)
+        : client(c), chunked(isChunked), remaining(isChunked ? -1 : 0), eof(false) {}
+
+    int readByte() {
+        if (eof || is_aborted()) return -1;
+        if (!chunked) return rawRead();
+        if (remaining == 0) { skipTrailer(); remaining = -1; }
+        if (remaining < 0) {
+            remaining = nextChunkSize();
+            if (remaining <= 0) { eof = true; return -1; }
+        }
+        int c = rawRead();
+        if (c >= 0) remaining--;
+        else eof = true;
+        return c;
+    }
+
+private:
+    int rawRead() {
+        unsigned long t = millis();
+        while (millis() - t < 30000) {
+            if (is_aborted()) return -1;
+            if (client.available()) return client.read();
+            if (!client.connected()) break;
             delay(1);
         }
+        return -1;
     }
-    buf[len] = '\0';
-    return len;
-}
 
-static void decode_chunked_in_place(char* buf, int* len) {
-    if (!buf || !len || *len <= 0) return;
+    int nextChunkSize() {
+        char buf[16];
+        int p = 0;
+        unsigned long t = millis();
+        while (p < 15 && millis() - t < 10000) {
+            if (is_aborted()) return 0;
+            if (client.available()) {
+                char c = client.read();
+                if (c == '\n') break;
+                if (c != '\r' && c != ' ') buf[p++] = c;
+            } else if (!client.connected()) {
+                return 0;
+            } else {
+                delay(1);
+            }
+        }
+        buf[p] = '\0';
+        return (int)strtol(buf, nullptr, 16);
+    }
 
-    int i = 0;
-    while (i < *len && (buf[i] == ' ' || buf[i] == '\t' || buf[i] == '\r' || buf[i] == '\n')) i++;
-    if (i < *len && (buf[i] == '{' || buf[i] == '[')) return;
-
-    char* src = buf;
-    char* dst = buf;
-    char* end = buf + *len;
-
-    while (src < end) {
-        char* line_end = strstr(src, "\r\n");
-        if (!line_end) break;
-
-        unsigned long chunk_size = strtoul(src, nullptr, 16);
-        if (chunk_size == 0) break;
-
-        src = line_end + 2;
-        if (src + chunk_size > end) break;
-
-        memmove(dst, src, chunk_size);
-        dst += chunk_size;
-        src += chunk_size;
-
-        if (src + 2 <= end && src[0] == '\r' && src[1] == '\n') {
-            src += 2;
+    void skipTrailer() {
+        for (int i = 0; i < 2; i++) {
+            unsigned long t = millis();
+            while (millis() - t < 5000) {
+                if (is_aborted()) return;
+                if (client.available()) { client.read(); break; }
+                if (!client.connected()) return;
+                delay(1);
+            }
         }
     }
+};
 
-    *len = (int)(dst - buf);
-    buf[*len] = '\0';
+// ── SSE line reader ───────────────────────────────────────────
+
+static bool read_sse_line(ChunkedReader& reader, char* buf, int maxLen) {
+    int pos = 0;
+    while (pos < maxLen - 1) {
+        int c = reader.readByte();
+        if (c < 0) { buf[pos] = '\0'; return pos > 0; }
+        if (c == '\n') { buf[pos] = '\0'; return true; }
+        if (c != '\r') buf[pos++] = (char)c;
+    }
+    buf[pos] = '\0';
+    return true;
 }
+
+// ── Text accumulator (capped at M5CLAW_LLM_TEXT_MAX) ─────────
+
+static bool text_append(LlmResponse* resp, const char* str, size_t len) {
+    if (!len) return true;
+    size_t new_len = resp->text_len + len;
+    if (new_len >= M5CLAW_LLM_TEXT_MAX) {
+        if (resp->text_len >= M5CLAW_LLM_TEXT_MAX - 1) return true;
+        len = M5CLAW_LLM_TEXT_MAX - 1 - resp->text_len;
+        new_len = resp->text_len + len;
+    }
+    char* nb = (char*)realloc(resp->text, new_len + 1);
+    if (!nb) return false;
+    memcpy(nb + resp->text_len, str, len);
+    nb[new_len] = '\0';
+    resp->text = nb;
+    resp->text_len = new_len;
+    return true;
+}
+
+// ── Request body builders ─────────────────────────────────────
 
 static void build_anthropic_body(JsonDocument& doc, const char* system_prompt,
                                   JsonDocument& messages, const char* tools_json) {
     doc["model"] = s_model;
     doc["max_tokens"] = M5CLAW_LLM_MAX_TOKENS;
+    doc["stream"] = true;
     doc["system"] = system_prompt;
 
     JsonArray msgs = doc["messages"].to<JsonArray>();
     JsonArray src = messages.as<JsonArray>();
-    for (JsonVariant v : src) {
-        msgs.add(v);
-    }
+    for (JsonVariant v : src) msgs.add(v);
 
     if (tools_json) {
         JsonDocument toolsDoc;
@@ -198,17 +257,15 @@ static void build_openai_body(JsonDocument& doc, const char* system_prompt,
                                JsonDocument& messages, const char* tools_json) {
     doc["model"] = s_model;
     doc["max_completion_tokens"] = M5CLAW_LLM_MAX_TOKENS;
+    doc["stream"] = true;
 
     JsonArray msgs = doc["messages"].to<JsonArray>();
-
     JsonObject sysMsg = msgs.add<JsonObject>();
     sysMsg["role"] = "system";
     sysMsg["content"] = system_prompt;
 
     JsonArray src = messages.as<JsonArray>();
-    for (JsonVariant v : src) {
-        msgs.add(v);
-    }
+    for (JsonVariant v : src) msgs.add(v);
 
     if (tools_json) {
         JsonDocument toolsDoc;
@@ -227,102 +284,207 @@ static void build_openai_body(JsonDocument& doc, const char* system_prompt,
     }
 }
 
-static void parse_anthropic_response(char* json, size_t len, LlmResponse* resp) {
+// ── Build raw_content_json from streamed data ─────────────────
+
+static void build_raw_content_json(LlmResponse* resp) {
     JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, json, len);
-    if (err) {
-        Serial.printf("[LLM] Parse error: %s\n", err.c_str());
-        return;
+    JsonArray arr = doc.to<JsonArray>();
+
+    if (resp->text && resp->text_len > 0) {
+        JsonObject tb = arr.add<JsonObject>();
+        tb["type"] = "text";
+        tb["text"] = resp->text;
+    }
+    for (int i = 0; i < resp->call_count; i++) {
+        JsonObject tu = arr.add<JsonObject>();
+        tu["type"] = "tool_use";
+        tu["id"] = resp->calls[i].id;
+        tu["name"] = resp->calls[i].name;
+        JsonDocument inputDoc;
+        deserializeJson(inputDoc, resp->calls[i].input ? resp->calls[i].input : "{}");
+        tu["input"] = inputDoc;
     }
 
-    const char* stop = doc["stop_reason"] | "";
-    resp->tool_use = (strcmp(stop, "tool_use") == 0);
+    String raw;
+    serializeJson(arr, raw);
+    resp->raw_content_json = strdup(raw.c_str());
+}
 
-    JsonArray content = doc["content"].as<JsonArray>();
-    if (content.isNull()) return;
+// ── Anthropic SSE stream processor ────────────────────────────
 
-    String rawContent;
-    serializeJson(content, rawContent);
-    if (rawContent.length() > 0) {
-        resp->raw_content_json = strdup(rawContent.c_str());
-    }
+static bool process_anthropic_stream(ChunkedReader& reader, LlmResponse* resp,
+                                      LlmStreamCallback on_token) {
+    char* line = (char*)alloc_prefer_psram(M5CLAW_SSE_LINE_BUF);
+    if (!line) return false;
 
-    size_t total_text = 0;
-    for (JsonVariant block : content) {
-        if (strcmp(block["type"] | "", "text") == 0) {
-            total_text += strlen(block["text"] | "");
-        }
-    }
+    String tool_inputs[M5CLAW_MAX_TOOL_CALLS];
+    int current_tool_idx = -1;
+    bool got_response = false;
 
-    if (total_text > 0) {
-        resp->text = (char*)calloc(1, total_text + 1);
-        if (resp->text) {
-            for (JsonVariant block : content) {
-                if (strcmp(block["type"] | "", "text") != 0) continue;
-                const char* t = block["text"] | "";
-                size_t tl = strlen(t);
-                memcpy(resp->text + resp->text_len, t, tl);
-                resp->text_len += tl;
+    while (!is_aborted()) {
+        if (!read_sse_line(reader, line, M5CLAW_SSE_LINE_BUF)) break;
+
+        if (strncmp(line, "data: ", 6) != 0) continue;
+        const char* json = line + 6;
+
+        JsonDocument chunk;
+        if (deserializeJson(chunk, json) != DeserializationError::Ok) continue;
+
+        const char* type = chunk["type"] | "";
+
+        if (strcmp(type, "content_block_start") == 0) {
+            JsonObject block = chunk["content_block"];
+            const char* btype = block["type"] | "";
+            if (strcmp(btype, "tool_use") == 0 && resp->call_count < M5CLAW_MAX_TOOL_CALLS) {
+                current_tool_idx = resp->call_count;
+                LlmToolCall& call = resp->calls[resp->call_count];
+                memset(&call, 0, sizeof(call));
+                strlcpy(call.id, block["id"] | "", sizeof(call.id));
+                strlcpy(call.name, block["name"] | "", sizeof(call.name));
+                resp->call_count++;
             }
-            resp->text[resp->text_len] = '\0';
+        }
+        else if (strcmp(type, "content_block_delta") == 0) {
+            JsonObject delta = chunk["delta"];
+            const char* dtype = delta["type"] | "";
+
+            if (strcmp(dtype, "text_delta") == 0) {
+                const char* text = delta["text"] | "";
+                size_t tlen = strlen(text);
+                if (tlen > 0) {
+                    text_append(resp, text, tlen);
+                    if (on_token) on_token(text);
+                    got_response = true;
+                }
+            }
+            else if (strcmp(dtype, "input_json_delta") == 0) {
+                const char* partial = delta["partial_json"] | "";
+                if (current_tool_idx >= 0 && current_tool_idx < M5CLAW_MAX_TOOL_CALLS)
+                    tool_inputs[current_tool_idx] += partial;
+            }
+        }
+        else if (strcmp(type, "content_block_stop") == 0) {
+            if (current_tool_idx >= 0 && current_tool_idx < resp->call_count) {
+                String& inp = tool_inputs[current_tool_idx];
+                if (inp.length() > 0) {
+                    resp->calls[current_tool_idx].input = strdup(inp.c_str());
+                    resp->calls[current_tool_idx].input_len = inp.length();
+                    inp = "";
+                }
+            }
+            current_tool_idx = -1;
+        }
+        else if (strcmp(type, "message_delta") == 0) {
+            const char* stop = chunk["delta"]["stop_reason"] | "";
+            resp->tool_use = (strcmp(stop, "tool_use") == 0);
+            got_response = true;
+        }
+        else if (strcmp(type, "message_stop") == 0) {
+            got_response = true;
+            break;
+        }
+        else if (strcmp(type, "error") == 0) {
+            const char* msg = chunk["error"]["message"] | "unknown error";
+            Serial.printf("[LLM] Stream error: %s\n", msg);
+            break;
         }
     }
 
-    for (JsonVariant block : content) {
-        if (strcmp(block["type"] | "", "tool_use") != 0) continue;
-        if (resp->call_count >= M5CLAW_MAX_TOOL_CALLS) break;
-        LlmToolCall& call = resp->calls[resp->call_count];
-        memset(&call, 0, sizeof(call));
-        strlcpy(call.id, block["id"] | "", sizeof(call.id));
-        strlcpy(call.name, block["name"] | "", sizeof(call.name));
-        String inputStr;
-        serializeJson(block["input"], inputStr);
-        call.input = strdup(inputStr.c_str());
-        call.input_len = inputStr.length();
-        resp->call_count++;
-    }
+    if (resp->tool_use || resp->call_count > 0)
+        build_raw_content_json(resp);
+
+    heap_caps_free(line);
+    return got_response;
 }
 
-static void parse_openai_response(char* json, size_t len, LlmResponse* resp) {
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, json, len);
-    if (err) {
-        Serial.printf("[LLM] Parse error: %s\n", err.c_str());
-        return;
-    }
+// ── OpenAI SSE stream processor ───────────────────────────────
 
-    JsonObject choice = doc["choices"][0];
-    const char* finish = choice["finish_reason"] | "";
-    resp->tool_use = (strcmp(finish, "tool_calls") == 0);
+static bool process_openai_stream(ChunkedReader& reader, LlmResponse* resp,
+                                   LlmStreamCallback on_token) {
+    char* line = (char*)alloc_prefer_psram(M5CLAW_SSE_LINE_BUF);
+    if (!line) return false;
 
-    JsonObject message = choice["message"];
-    const char* content = message["content"] | "";
-    if (strlen(content) > 0) {
-        resp->text = strdup(content);
-        resp->text_len = strlen(content);
-    }
+    String tool_inputs[M5CLAW_MAX_TOOL_CALLS];
+    bool got_response = false;
 
-    JsonArray tool_calls = message["tool_calls"].as<JsonArray>();
-    if (!tool_calls.isNull()) {
-        for (JsonVariant tc : tool_calls) {
-            if (resp->call_count >= M5CLAW_MAX_TOOL_CALLS) break;
-            LlmToolCall& call = resp->calls[resp->call_count];
-            memset(&call, 0, sizeof(call));
-            strlcpy(call.id, tc["id"] | "", sizeof(call.id));
-            strlcpy(call.name, tc["function"]["name"] | "", sizeof(call.name));
-            const char* args = tc["function"]["arguments"] | "{}";
-            call.input = strdup(args);
-            call.input_len = strlen(args);
-            resp->call_count++;
+    while (!is_aborted()) {
+        if (!read_sse_line(reader, line, M5CLAW_SSE_LINE_BUF)) break;
+
+        if (strncmp(line, "data: ", 6) != 0) continue;
+        const char* data = line + 6;
+
+        if (strcmp(data, "[DONE]") == 0) {
+            got_response = true;
+            break;
         }
-        if (resp->call_count > 0) resp->tool_use = true;
+
+        JsonDocument chunk;
+        if (deserializeJson(chunk, data) != DeserializationError::Ok) continue;
+
+        JsonObject choice = chunk["choices"][0];
+        JsonObject delta = choice["delta"];
+
+        const char* content = delta["content"] | (const char*)nullptr;
+        if (content) {
+            size_t clen = strlen(content);
+            if (clen > 0) {
+                text_append(resp, content, clen);
+                if (on_token) on_token(content);
+                got_response = true;
+            }
+        }
+
+        JsonArray tool_calls = delta["tool_calls"];
+        if (!tool_calls.isNull()) {
+            for (JsonVariant tc : tool_calls) {
+                int idx = tc["index"] | 0;
+                if (idx >= M5CLAW_MAX_TOOL_CALLS) continue;
+
+                const char* tc_id = tc["id"] | (const char*)nullptr;
+                const char* fn_name = tc["function"]["name"] | (const char*)nullptr;
+                if (tc_id && resp->call_count <= idx) {
+                    LlmToolCall& call = resp->calls[idx];
+                    memset(&call, 0, sizeof(call));
+                    strlcpy(call.id, tc_id, sizeof(call.id));
+                    if (fn_name) strlcpy(call.name, fn_name, sizeof(call.name));
+                    if (idx >= resp->call_count) resp->call_count = idx + 1;
+                }
+
+                const char* args = tc["function"]["arguments"] | (const char*)nullptr;
+                if (args && idx < M5CLAW_MAX_TOOL_CALLS)
+                    tool_inputs[idx] += args;
+            }
+        }
+
+        const char* finish = choice["finish_reason"] | (const char*)nullptr;
+        if (finish) {
+            resp->tool_use = (strcmp(finish, "tool_calls") == 0);
+            got_response = true;
+        }
     }
+
+    for (int i = 0; i < resp->call_count; i++) {
+        if (tool_inputs[i].length() > 0 && resp->calls[i].input == nullptr) {
+            resp->calls[i].input = strdup(tool_inputs[i].c_str());
+            resp->calls[i].input_len = tool_inputs[i].length();
+        }
+    }
+    if (resp->call_count > 0) resp->tool_use = true;
+
+    if (resp->tool_use)
+        build_raw_content_json(resp);
+
+    heap_caps_free(line);
+    return got_response;
 }
+
+// ── Main LLM function (SSE streaming) ─────────────────────────
 
 bool llm_chat_tools(const char* system_prompt,
                     JsonDocument& messages,
                     const char* tools_json,
-                    LlmResponse* resp) {
+                    LlmResponse* resp,
+                    LlmStreamCallback on_token) {
     memset(resp, 0, sizeof(*resp));
     if (s_api_key[0] == '\0') {
         Serial.println("[LLM] No API key configured");
@@ -356,7 +518,7 @@ bool llm_chat_tools(const char* system_prompt,
     client.printf("POST %s HTTP/1.1\r\n", llm_path());
     client.printf("Host: %s\r\n", llm_host());
     client.println("Content-Type: application/json");
-    client.println("Accept: application/json");
+    client.println("Accept: text/event-stream");
     if (provider_is_openai()) {
         client.printf("Authorization: Bearer %s\r\n", s_api_key);
     } else {
@@ -379,67 +541,30 @@ bool llm_chat_tools(const char* system_prompt,
         return false;
     }
 
-    if (!skip_http_headers(client)) {
+    bool chunked = false;
+    if (!skip_http_headers(client, &chunked)) {
         Serial.println("[LLM] Disconnected or aborted waiting for response");
         client.stop();
         return false;
     }
 
-    const size_t HEAP_RESERVE = 16 * 1024;
-    size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-    size_t bufSize = (largest > HEAP_RESERVE) ? largest - HEAP_RESERVE : 0;
-    if (bufSize > 64 * 1024) bufSize = 64 * 1024;
+    Serial.printf("[LLM] Streaming response (chunked=%d, heap=%d)\n", chunked, ESP.getFreeHeap());
 
-    char* respBuf = nullptr;
-    if (bufSize >= 8 * 1024) {
-        respBuf = (char*)heap_caps_malloc(bufSize, MALLOC_CAP_8BIT);
-    }
-    if (!respBuf) { bufSize = 32 * 1024; respBuf = (char*)heap_caps_malloc(bufSize, MALLOC_CAP_8BIT); }
-    if (!respBuf) { bufSize = 16 * 1024; respBuf = (char*)heap_caps_malloc(bufSize, MALLOC_CAP_8BIT); }
-    if (!respBuf) { bufSize =  8 * 1024; respBuf = (char*)heap_caps_malloc(bufSize, MALLOC_CAP_8BIT); }
-    if (!respBuf) {
-        Serial.printf("[LLM] OOM for response buffer, heap=%d largest=%d\n",
-                      ESP.getFreeHeap(), (int)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-        client.stop();
-        return false;
-    }
-    respBuf[0] = '\0';
-    Serial.printf("[LLM] Response buffer: %dKB (heap=%d)\n", (int)(bufSize / 1024), ESP.getFreeHeap());
-
-    int respLen = read_http_body(client, respBuf, (int)bufSize);
-    client.stop();
-    decode_chunked_in_place(respBuf, &respLen);
-
-    Serial.printf("[LLM] Response %d bytes\n", respLen);
-
-    if (respLen == 0) {
-        heap_caps_free(respBuf);
-        return false;
-    }
-
-    if (respLen + 1024 < (int)bufSize) {
-        char* compact = (char*)malloc(respLen + 1);
-        if (compact) {
-            memcpy(compact, respBuf, respLen + 1);
-            heap_caps_free(respBuf);
-            respBuf = compact;
-            bufSize = respLen + 1;
-        }
-    }
-
+    ChunkedReader reader(client, chunked);
+    bool ok;
     if (provider_is_openai()) {
-        parse_openai_response(respBuf, respLen, resp);
+        ok = process_openai_stream(reader, resp, on_token);
     } else {
-        parse_anthropic_response(respBuf, respLen, resp);
+        ok = process_anthropic_stream(reader, resp, on_token);
     }
 
-    if (!resp->tool_use && (!resp->text || resp->text_len == 0)) {
-        Serial.printf("[LLM] Empty/unknown response: %.300s\n", respBuf);
-    }
+    client.stop();
 
-    free(respBuf);
+    if (!ok && (!resp->text || resp->text_len == 0) && resp->call_count == 0) {
+        Serial.println("[LLM] Empty/failed stream response");
+    }
 
     Serial.printf("[LLM] %d text bytes, %d tool calls, tool_use=%d\n",
                   (int)resp->text_len, resp->call_count, resp->tool_use);
-    return true;
+    return ok;
 }

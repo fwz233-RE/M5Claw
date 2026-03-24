@@ -173,3 +173,7 @@ void CronService::listJobs(const CronJob** jobs, int* count) {
     *jobs = s_jobs;
     *count = s_jobCount;
 }
+
+int CronService::getJobCount() {
+    return s_jobCount;
+}
