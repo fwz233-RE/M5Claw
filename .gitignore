@@ -28,7 +28,8 @@ spiffs.bin
 # 操作系统文件
 .DS_Store
 Thumbs.db
-desktop.ini
+desktop.
+gen_sprites.py
 
 # 临时文件
 *.tmp
