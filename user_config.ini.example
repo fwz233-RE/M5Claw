@@ -1,0 +1,16 @@
+; Local build-time config template for M5ClawPro.
+; Copy to user_config.ini and keep that file uncommitted.
+; Sensitive fields are compiled into the firmware for runtime use,
+; but are not persisted back into device NVS by the firmware.
+
+[user]
+wifi_ssid =
+wifi_pass =
+
+mimo_model = mimo-v2-omni
+mimo_api_key =
+
+city = Beijing
+
+wechat_token =
+wechat_api_host =

@@ -23,6 +23,28 @@
 #include <freertos/queue.h>
 #include "soc/rtc_cntl_reg.h"
 
+#ifndef USER_WIFI_SSID
+#define USER_WIFI_SSID ""
+#endif
+#ifndef USER_WIFI_PASS
+#define USER_WIFI_PASS ""
+#endif
+#ifndef USER_MIMO_KEY
+#define USER_MIMO_KEY ""
+#endif
+#ifndef USER_MIMO_MODEL
+#define USER_MIMO_MODEL ""
+#endif
+#ifndef USER_CITY
+#define USER_CITY ""
+#endif
+#ifndef USER_WECHAT_TOKEN
+#define USER_WECHAT_TOKEN ""
+#endif
+#ifndef USER_WECHAT_HOST
+#define USER_WECHAT_HOST ""
+#endif
+
 M5Canvas canvas(&M5Cardputer.Display);
 Companion companion;
 Chat chat;
@@ -61,6 +83,7 @@ String stopVoiceRecording();
 void streamVoiceData();
 void processSerialCommands();
 void dispatchOutbound();
+void fillBuildTimeDefaults();
 
 static void onAgentResponse(const char* text);
 static void onAgentToken(const char* token);
@@ -74,6 +97,27 @@ static volatile bool s_hasStreamedTokens = false;
 static bool hasPreconfiguredOnlineSettings() {
     return Config::getLlmApiKey().length() > 0
         && Config::getLlmModel().length() > 0;
+}
+
+static void setIfEmpty(void (*setter)(const String&), const String& current, const char* buildVal) {
+    if (current.length() == 0 && buildVal && buildVal[0]) {
+        setter(String(buildVal));
+    }
+}
+
+void fillBuildTimeDefaults() {
+    setIfEmpty(Config::setSSID,           Config::getSSID(),           USER_WIFI_SSID);
+    setIfEmpty(Config::setPassword,       Config::getPassword(),       USER_WIFI_PASS);
+    setIfEmpty(Config::setLlmModel,       Config::getLlmModel(),       USER_MIMO_MODEL);
+    setIfEmpty(Config::setCity,           Config::getCity(),           USER_CITY);
+    setIfEmpty(Config::setWechatApiHost,  Config::getWechatApiHost(),  USER_WECHAT_HOST);
+
+    if (USER_MIMO_KEY[0]) {
+        Config::setTransientLlmApiKey(String(USER_MIMO_KEY));
+    }
+    if (USER_WECHAT_TOKEN[0]) {
+        Config::setTransientWechatToken(String(USER_WECHAT_TOKEN));
+    }
 }
 
 static bool isSensitiveNvsKey(const char* key) {
@@ -262,6 +306,7 @@ void setup() {
     MemoryStore::init();
     Config::importBootstrapFile();
     Config::applyDefaults();
+    fillBuildTimeDefaults();
     Config::save();
     Serial.println("[BOOT] Config loaded");
     Serial.println("[BOOT] Type 'help' in serial monitor for config commands");
