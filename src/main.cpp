@@ -76,6 +76,12 @@ static bool hasPreconfiguredOnlineSettings() {
         && Config::getLlmModel().length() > 0;
 }
 
+static bool isSensitiveNvsKey(const char* key) {
+    return strcmp(key, "pass") == 0
+        || strcmp(key, "llm_key") == 0
+        || strcmp(key, "wc_token") == 0;
+}
+
 // ── M5Burner NVS Configure protocol ──────────────────────────
 static const char* const NVS_KEYS[] = {
     "ssid", "pass", "llm_key", "llm_model",
@@ -83,6 +89,7 @@ static const char* const NVS_KEYS[] = {
 };
 
 static String nvsGet(const char* key) {
+    if (isSensitiveNvsKey(key)) return "";
     if (strcmp(key, "ssid") == 0)      return Config::getSSID();
     if (strcmp(key, "pass") == 0)      return Config::getPassword();
     if (strcmp(key, "llm_key") == 0)   return Config::getLlmApiKey();
@@ -115,7 +122,8 @@ static bool handleBurnerNVS(const String& line) {
         Serial.println(keys);
     } else if (line.startsWith("CMD::GET:")) {
         String key = line.substring(9);
-        Serial.println(nvsGet(key.c_str()));
+        if (isSensitiveNvsKey(key.c_str())) Serial.println("__PROTECTED__");
+        else Serial.println(nvsGet(key.c_str()));
     } else if (line.startsWith("CMD::SET:")) {
         String payload = line.substring(9);
         int eq = payload.indexOf('=');
