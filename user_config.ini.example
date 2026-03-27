@@ -11,6 +11,3 @@ mimo_model = mimo-v2-omni
 mimo_api_key =
 
 city = Beijing
-
-wechat_token =
-wechat_api_host =

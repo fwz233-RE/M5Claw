@@ -38,12 +38,6 @@
 #ifndef USER_CITY
 #define USER_CITY ""
 #endif
-#ifndef USER_WECHAT_TOKEN
-#define USER_WECHAT_TOKEN ""
-#endif
-#ifndef USER_WECHAT_HOST
-#define USER_WECHAT_HOST ""
-#endif
 
 M5Canvas canvas(&M5Cardputer.Display);
 Companion companion;
@@ -110,13 +104,9 @@ void fillBuildTimeDefaults() {
     setIfEmpty(Config::setPassword,       Config::getPassword(),       USER_WIFI_PASS);
     setIfEmpty(Config::setLlmModel,       Config::getLlmModel(),       USER_MIMO_MODEL);
     setIfEmpty(Config::setCity,           Config::getCity(),           USER_CITY);
-    setIfEmpty(Config::setWechatApiHost,  Config::getWechatApiHost(),  USER_WECHAT_HOST);
 
     if (USER_MIMO_KEY[0]) {
         Config::setTransientLlmApiKey(String(USER_MIMO_KEY));
-    }
-    if (USER_WECHAT_TOKEN[0]) {
-        Config::setTransientWechatToken(String(USER_WECHAT_TOKEN));
     }
 }
 

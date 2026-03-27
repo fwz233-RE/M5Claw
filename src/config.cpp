@@ -92,7 +92,6 @@ static String ssid, password, ssid2, password2, city;
 static String llmApiKey, llmModel;
 static String wechatToken, wechatApiHost;
 static bool llmApiKeyTransient = false;
-static bool wechatTokenTransient = false;
 
 static bool applyBootstrapValue(const JsonVariantConst& value, String& target) {
     if (value.isNull()) return false;
@@ -116,7 +115,6 @@ bool Config::load() {
     wechatApiHost   = prefs.getString("wc_host", "");
     prefs.end();
     llmApiKeyTransient = false;
-    wechatTokenTransient = false;
     return ssid.length() > 0;
 }
 
@@ -130,8 +128,7 @@ void Config::save() {
     if (llmApiKeyTransient) prefs.remove("llm_key");
     else writeSecret("llm_key",  llmApiKey);
     prefs.putString("llm_model", llmModel);
-    if (wechatTokenTransient) prefs.remove("wc_token");
-    else writeSecret("wc_token", wechatToken);
+    writeSecret("wc_token",      wechatToken);
     prefs.putString("wc_host",   wechatApiHost);
     prefs.end();
 }
@@ -144,7 +141,6 @@ void Config::reset() {
     llmApiKey = llmModel = "";
     wechatToken = wechatApiHost = "";
     llmApiKeyTransient = false;
-    wechatTokenTransient = false;
 }
 
 bool Config::importBootstrapFile() {
@@ -202,9 +198,8 @@ void Config::setPassword2(const String& p)       { password2 = p; }
 void Config::setCity(const String& c)            { city = c; }
 void Config::setLlmApiKey(const String& k)       { llmApiKey = k; llmApiKeyTransient = false; }
 void Config::setLlmModel(const String& m)        { llmModel = m; }
-void Config::setWechatToken(const String& t)     { wechatToken = t; wechatTokenTransient = false; }
+void Config::setWechatToken(const String& t)     { wechatToken = t; }
 void Config::setWechatApiHost(const String& h)   { wechatApiHost = h; }
 void Config::setTransientLlmApiKey(const String& k) { llmApiKey = k; llmApiKeyTransient = true; }
-void Config::setTransientWechatToken(const String& t) { wechatToken = t; wechatTokenTransient = true; }
 
 bool Config::isValid() { return ssid.length() > 0 && llmApiKey.length() > 0; }

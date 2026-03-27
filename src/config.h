@@ -32,7 +32,6 @@ namespace Config {
     void setWechatToken(const String& token);
     void setWechatApiHost(const String& host);
     void setTransientLlmApiKey(const String& key);
-    void setTransientWechatToken(const String& token);
 
     bool isValid();
 }

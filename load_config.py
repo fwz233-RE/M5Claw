@@ -24,8 +24,6 @@ else:
         "mimo_api_key": "USER_MIMO_KEY",
         "mimo_model": "USER_MIMO_MODEL",
         "city": "USER_CITY",
-        "wechat_token": "USER_WECHAT_TOKEN",
-        "wechat_api_host": "USER_WECHAT_HOST",
     }
 
     flags = []
