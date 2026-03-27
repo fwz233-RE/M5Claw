@@ -2,7 +2,7 @@
 
 M5ClawPro 是一个运行在 M5Stack Cardputer 上的 AI 助手固件，围绕 `ESP32-S3 + SPIFFS + PlatformIO + Xiaomi MiMo` 构建，提供本地陪伴界面、键盘聊天、语音输入、语音播报、微信互联、天气显示、定时任务、记忆文件和技能扩展能力。
 
-项目面向“可直接刷进设备并长期运行”的形态，而不是单次 Demo。仓库内已经包含固件代码、SPIFFS 数据、配置导入脚本和一键刷机脚本。
+项目面向“可直接刷进设备并长期运行”的形态，而不是单次 Demo。仓库内已经包含固件代码、SPIFFS 数据和一键刷机脚本。
 
 ## 功能概览
 
@@ -39,14 +39,12 @@ M5ClawPro 是一个运行在 M5Stack Cardputer 上的 AI 助手固件，围绕 `
 ├─ src/                   固件源码
 ├─ data/
 │  ├─ cert/               TLS 证书包
-│  ├─ config/             人设、用户资料、引导配置
+│  ├─ config/             人设、用户资料
 │  ├─ memory/             长期记忆
 │  └─ skills/             内置技能
 ├─ flash.py               一键刷机脚本
-├─ load_config.py         将 user_config.ini 转成 BOOTSTRAP.json
 ├─ platformio.ini         PlatformIO 构建配置
 ├─ partitions.csv         分区表
-└─ user_config.ini.example
 ```
 
 ## 环境要求
@@ -71,41 +69,7 @@ pio --version
 
 如果你在 Windows 上，`python` 不可用时也可以改用 `py -3`。
 
-### 2. 准备配置
-
-复制示例配置：
-
-```powershell
-Copy-Item user_config.ini.example user_config.ini
-```
-
-然后编辑 `user_config.ini`：
-
-```ini
-[user]
-wifi_ssid = YourWiFi
-wifi_pass = YourPassword
-
-mimo_model = mimo-v2-omni
-mimo_api_key = YOUR_MIMO_API_KEY
-
-city = Beijing
-
-wechat_token =
-wechat_api_host =
-```
-
-说明：
-
-- `wifi_ssid`、`wifi_pass`：设备联网所需。
-- `mimo_api_key`：必填，没有它无法使用 AI。
-- `mimo_model`：默认是 `mimo-v2-omni`。
-- `city`：用于天气，建议填英文城市名。
-- `wechat_token`、`wechat_api_host`：可选，不填也能先使用本地 AI；之后也可以在设备上扫码配对或通过串口命令配置。
-
-`user_config.ini` 已被 `.gitignore` 忽略，不会提交到仓库。
-
-### 3. 刷写固件
+### 2. 刷写固件
 
 推荐直接使用仓库自带脚本：
 
@@ -143,20 +107,16 @@ pio device monitor -b 115200
 
 1. 挂载 SPIFFS
 2. 读取 NVS 配置
-3. 从 `data/config/BOOTSTRAP.json` 导入引导配置
+3. 初始化运行时配置
 4. 初始化记忆、技能、工具、微信、定时器和 Agent
 5. 如果配置完整则自动联网，否则进入 Setup 模式
 
-`load_config.py` 会在构建前把 `user_config.ini` 转成 `data/config/BOOTSTRAP.json`。设备首次启动时会将这份引导配置导入 NVS，并删除该文件。
-
-如果没有预置配置，设备会进入板载 Setup：
+设备首次启动时会进入板载 Setup：
 
 - 依次输入 Wi-Fi、MiMo Key、模型名、城市
 - `Enter` 确认当前字段
 - `Del` 删除字符
 - `Tab` 跳过并进入离线模式
-
-如果已经预置了 MiMo 配置，首次 Setup 只会要求输入 Wi-Fi。
 
 ## 设备操作
 
