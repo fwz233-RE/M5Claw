@@ -380,7 +380,20 @@ static void busResponseHandler(const AgentResponseInfo* info) {
     if (strcmp(info->channel, M5CLAW_CHAN_LOCAL) == 0) return;
 
     if (strcmp(info->channel, M5CLAW_CHAN_WECHAT) == 0) {
-        WechatBot::sendMessage(info->chatId, info->text);
+        BusMessage msg = {};
+        strlcpy(msg.channel, M5CLAW_CHAN_WECHAT, sizeof(msg.channel));
+        strlcpy(msg.chat_id, info->chatId ? info->chatId : "", sizeof(msg.chat_id));
+        msg.content = info->text ? strdup(info->text) : nullptr;
+
+        bool sent = WechatBot::sendMessage(info->chatId, info->text);
+        if (!sent && msg.content) {
+            Serial.println("[AGENT] Direct WeChat send failed, queueing outbound retry");
+            if (!MessageBus::pushOutbound(&msg)) {
+                free(msg.content);
+            }
+        } else {
+            free(msg.content);
+        }
         return;
     }
 }
@@ -446,7 +459,19 @@ static void agent_task(void* arg) {
             if (strcmp(req.channel, M5CLAW_CHAN_WECHAT) == 0 && req.chatId[0]) {
                 bool wxa = WechatBot::isRunning();
                 if (wxa) WechatBot::stop();
-                WechatBot::sendMessage(req.chatId, req.text);
+                bool sent = WechatBot::sendMessage(req.chatId, req.text);
+                if (!sent) {
+                    BusMessage out = {};
+                    strlcpy(out.channel, M5CLAW_CHAN_WECHAT, sizeof(out.channel));
+                    strlcpy(out.chat_id, req.chatId, sizeof(out.chat_id));
+                    out.content = strdup(req.text ? req.text : "");
+                    if (out.content) {
+                        Serial.println("[AGENT] Cron WeChat send failed, queueing outbound retry");
+                        if (!MessageBus::pushOutbound(&out)) {
+                            free(out.content);
+                        }
+                    }
+                }
                 if (wxa) WechatBot::resume();
             }
 

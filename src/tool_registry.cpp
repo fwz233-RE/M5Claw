@@ -104,6 +104,7 @@ static bool tool_list_dir(const char* input, char* output, size_t sz) {
     JsonDocument doc;
     deserializeJson(doc, input);
     const char* prefix = doc["prefix"] | "";
+    size_t prefixLen = strlen(prefix);
 
     File root = SPIFFS.open("/");
     if (!root) { strlcpy(output, "Cannot open SPIFFS root", sz); return false; }
@@ -113,13 +114,15 @@ static bool tool_list_dir(const char* input, char* output, size_t sz) {
     int count = 0;
     while (f && off < sz - 60) {
         const char* name = f.name();
-        if (!prefix[0] || strstr(name, prefix) != nullptr) {
+        if (!prefix[0] || strncmp(name, prefix, prefixLen) == 0) {
             int w = snprintf(output + off, sz - off, "%s (%d bytes)\n", name, (int)f.size());
             if (w > 0) off += w;
             count++;
         }
+        f.close();
         f = root.openNextFile();
     }
+    root.close();
     if (count == 0) {
         snprintf(output, sz, "No files found%s%s", prefix[0] ? " matching " : "", prefix);
     }
@@ -158,12 +161,16 @@ static bool tool_cron_add(const char* input, char* output, size_t sz) {
         job.kind = CRON_KIND_EVERY;
         job.intervalSec = doc["interval_s"] | 3600;
         job.deleteAfterRun = false;
+        if (job.intervalSec == 0) {
+            strlcpy(output, "interval_s must be greater than 0", sz);
+            return false;
+        }
     }
 
     if (CronService::addJob(&job)) {
         snprintf(output, sz, "Cron job '%s' added (id=%s)", name, job.id);
     } else {
-        strlcpy(output, "Failed to add cron job (max jobs reached?)", sz);
+        strlcpy(output, "Failed to add cron job (time not synced, invalid schedule, or max jobs reached)", sz);
     }
     return true;
 }

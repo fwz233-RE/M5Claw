@@ -64,6 +64,21 @@ static size_t s_voicePcmBytes = 0;
 static bool s_voiceWriteFailed = false;
 static bool s_playTtsForNextLocalReply = false;
 
+static bool speakReplyWithPause(const char* text) {
+    bool wechatWasActive = WechatBot::isRunning();
+    if (wechatWasActive) {
+        WechatBot::stop();
+    }
+    bool ok = llm_speak_text(text);
+    if (wechatWasActive) {
+        WechatBot::resume();
+    }
+    if (!ok) {
+        Serial.println("[TTS] Speak failed");
+    }
+    return ok;
+}
+
 void enterSetupMode();
 void updateSetupMode();
 void handleSetupKey(char key, bool enter, bool backspace, bool tab);
@@ -376,7 +391,9 @@ void loop() {
             }
             chat.onAIResponseComplete();
             if (s_playTtsForNextLocalReply) {
-                llm_speak_text(agentResponseText);
+                if (!speakReplyWithPause(agentResponseText)) {
+                    companion.triggerIdle();
+                }
             } else {
                 companion.triggerIdle();
             }
@@ -496,6 +513,8 @@ void loop() {
             static bool pFn = false, pEnter = false, pDel = false, pTab = false;
             static bool pAlt = false, pCtrl = false;
             static char pWordChar = 0;
+            static unsigned long fnHoldStartMs = 0;
+            static bool fnRecordTriggered = false;
             bool didBlock = false;
 
             bool fnDown = ks.fn && !pFn;
@@ -503,9 +522,23 @@ void loop() {
             bool fnAlone = ks.fn && ks.word.size() == 0
                            && !ks.tab && !ks.enter && !ks.del;
 
-            if (!offlineMode && fnDown && fnAlone && !voiceRecording
-                && !Agent::isBusy()) {
+            if (fnUp) {
+                fnHoldStartMs = 0;
+                fnRecordTriggered = false;
+            } else if (fnAlone) {
+                if (fnDown || fnHoldStartMs == 0) {
+                    fnHoldStartMs = millis();
+                }
+            } else {
+                fnHoldStartMs = 0;
+                fnRecordTriggered = false;
+            }
+
+            if (!offlineMode && fnAlone && !fnRecordTriggered && !voiceRecording
+                && !Agent::isBusy() && !chat.isWaitingForAI()
+                && fnHoldStartMs != 0 && millis() - fnHoldStartMs >= 120) {
                 startVoiceRecording();
+                fnRecordTriggered = voiceRecording;
             }
             if (fnUp && voiceRecording) {
                 String audioPath = stopVoiceRecording();
@@ -518,6 +551,8 @@ void loop() {
                 } else if (audioPath.length() > 0) {
                     SPIFFS.remove(audioPath.c_str());
                 }
+                fnHoldStartMs = 0;
+                fnRecordTriggered = false;
                 didBlock = true;
             }
 

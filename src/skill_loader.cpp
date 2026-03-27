@@ -55,8 +55,10 @@ void SkillLoader::init() {
             extractMeta(name, &info);
             s_skillCount++;
         }
+        f.close();
         f = root.openNextFile();
     }
+    root.close();
     Serial.printf("[SKILLS] Found %d skills\n", s_skillCount);
 }
 

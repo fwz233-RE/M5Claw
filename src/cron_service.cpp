@@ -159,13 +159,18 @@ void CronService::start() {
 bool CronService::addJob(CronJob* job) {
     compactJobs();
 
+    if (!job) return false;
     if (s_jobCount >= M5CLAW_CRON_MAX_JOBS) return false;
+    if (job->kind == CRON_KIND_EVERY && job->intervalSec == 0) return false;
 
     generateId(job->id);
     int64_t now = nowEpoch();
+    if (now == 0) return false;
     job->lastRun = 0;
     if (job->kind == CRON_KIND_EVERY) {
         job->nextRun = now + job->intervalSec;
+    } else if (job->atEpoch <= 0) {
+        return false;
     }
     s_jobs[s_jobCount++] = *job;
     saveJobs();

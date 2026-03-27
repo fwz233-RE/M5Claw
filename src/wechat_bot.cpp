@@ -233,13 +233,15 @@ static const char* findStringField(JsonObject obj, const char* const* fields, si
 
 static bool extractImageCandidate(JsonObject item, String& imageUrl, String& mimeType) {
     static const char* const directFields[] = {
-        "image_url", "download_url", "url", "cdn_url", "origin_url", "thumb_url", "pic_url"
+        "image_url", "download_url", "downloadUrl", "url", "cdn_url", "origin_url",
+        "thumb_url", "pic_url", "file_url", "hd_url"
     };
     static const char* const mimeFields[] = {
-        "mime_type", "content_type", "file_type"
+        "mime_type", "content_type", "file_type", "mimeType"
     };
     static const char* const objectFields[] = {
-        "image_item", "pic_item", "media_item", "file_item"
+        "image_item", "pic_item", "media_item", "file_item",
+        "img_item", "image", "content", "payload", "data"
     };
 
     const char* direct = findStringField(item, directFields, sizeof(directFields) / sizeof(directFields[0]));

@@ -5,6 +5,8 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 
+static constexpr unsigned long kMediaHttpTimeoutMs = 20000;
+
 static bool parseHttpsUrl(const char* url, char* host, size_t hostSize,
                           char* path, size_t pathSize) {
     if (!url || strncmp(url, "https://", 8) != 0) return false;
@@ -23,7 +25,7 @@ static bool parseHttpsUrl(const char* url, char* host, size_t hostSize,
     return true;
 }
 
-static bool skipHeaders(WiFiClientSecure& client, bool* chunked,
+static bool skipHeaders(WiFiClientSecure& client, unsigned long deadline, bool* chunked,
                         char* mimeTypeOut, size_t mimeTypeOutSize) {
     *chunked = false;
     if (mimeTypeOut && mimeTypeOutSize) mimeTypeOut[0] = '\0';
@@ -31,7 +33,7 @@ static bool skipHeaders(WiFiClientSecure& client, bool* chunked,
     char line[256];
     int pos = 0;
     int state = 0;
-    while (client.connected()) {
+    while (client.connected() && millis() < deadline) {
         if (!client.available()) { delay(1); continue; }
         char c = client.read();
         if (c != '\r' && c != '\n' && pos < (int)sizeof(line) - 1) line[pos++] = c;
@@ -62,13 +64,15 @@ static bool skipHeaders(WiFiClientSecure& client, bool* chunked,
     return false;
 }
 
-static bool readChunkedBodyToFile(WiFiClientSecure& client, File& f, size_t maxBytes) {
+static bool readChunkedBodyToFile(WiFiClientSecure& client, File& f, size_t maxBytes,
+                                  unsigned long deadline) {
     size_t total = 0;
     while (true) {
         char sizeBuf[16];
         int pos = 0;
-        while (pos < (int)sizeof(sizeBuf) - 1) {
+        while (pos < (int)sizeof(sizeBuf) - 1 && millis() < deadline) {
             while (!client.available()) {
+                if (millis() >= deadline) return false;
                 if (!client.connected()) return false;
                 delay(1);
             }
@@ -85,6 +89,7 @@ static bool readChunkedBodyToFile(WiFiClientSecure& client, File& f, size_t maxB
             size_t got = 0;
             while (got < want) {
                 while (!client.available()) {
+                    if (millis() >= deadline) return false;
                     if (!client.connected()) return false;
                     delay(1);
                 }
@@ -97,6 +102,7 @@ static bool readChunkedBodyToFile(WiFiClientSecure& client, File& f, size_t maxB
         }
         for (int i = 0; i < 2; i++) {
             while (!client.available()) {
+                if (millis() >= deadline) return false;
                 if (!client.connected()) return false;
                 delay(1);
             }
@@ -105,10 +111,12 @@ static bool readChunkedBodyToFile(WiFiClientSecure& client, File& f, size_t maxB
     }
 }
 
-static bool readRawBodyToFile(WiFiClientSecure& client, File& f, size_t maxBytes) {
+static bool readRawBodyToFile(WiFiClientSecure& client, File& f, size_t maxBytes,
+                              unsigned long deadline) {
     size_t total = 0;
     uint8_t buf[512];
     while (true) {
+        if (millis() >= deadline) return false;
         if (client.available()) {
             int got = client.read(buf, sizeof(buf));
             if (got <= 0) continue;
@@ -164,9 +172,10 @@ bool MediaUtils::downloadHttpsUrlToFile(const char* url, const char* destPath,
     client.println("Connection: close");
     client.println();
 
+    unsigned long deadline = millis() + kMediaHttpTimeoutMs;
     bool chunked = false;
     char headerMime[48];
-    if (!skipHeaders(client, &chunked, headerMime, sizeof(headerMime))) {
+    if (!skipHeaders(client, deadline, &chunked, headerMime, sizeof(headerMime))) {
         client.stop();
         return false;
     }
@@ -177,8 +186,8 @@ bool MediaUtils::downloadHttpsUrlToFile(const char* url, const char* destPath,
         return false;
     }
 
-    bool ok = chunked ? readChunkedBodyToFile(client, f, maxBytes)
-                      : readRawBodyToFile(client, f, maxBytes);
+    bool ok = chunked ? readChunkedBodyToFile(client, f, maxBytes, deadline)
+                      : readRawBodyToFile(client, f, maxBytes, deadline);
     f.close();
     client.stop();
 
