@@ -24,6 +24,9 @@ namespace Agent {
 
     void sendMessage(const char* text, AgentResponseCallback onResponse,
                      AgentTokenCallback onToken = nullptr);
+    void sendVoiceMessage(const char* audioPath, const char* mimeType,
+                          AgentResponseCallback onResponse,
+                          AgentTokenCallback onToken = nullptr);
 
     bool isBusy();
     void requestAbort();

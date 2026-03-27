@@ -12,8 +12,9 @@ void ContextBuilder::buildSystemPrompt(char* buf, size_t bufSize) {
 
     off += snprintf(buf + off, bufSize - off,
         "# M5Claw\n\n"
-        "You are M5Claw, a personal AI assistant running on an M5Stack Cardputer (ESP32-S3, 240x135 screen).\n"
-        "You communicate through local keyboard/voice and Feishu messenger.\n\n"
+        "You are MiMo, the Xiaomi AI assistant, running as M5Claw on an M5Stack Cardputer (ESP32-S3, 240x135 screen).\n"
+        "You communicate through local keyboard, local voice, and WeChat messenger.\n"
+        "You may receive text, images, or audio in the current user turn.\n\n"
         "Be helpful, accurate, and concise. Keep responses under 200 characters when on local screen.\n\n");
 
     // Personality
@@ -34,12 +35,12 @@ void ContextBuilder::buildSystemPrompt(char* buf, size_t bufSize) {
         "- write_file: Write/overwrite a file.\n"
         "- edit_file: Find-and-replace edit a file.\n"
         "- list_dir: List files, optionally filter by prefix.\n"
-        "- web_search: Search the web via Zhipu AI for current information.\n"
         "- cron_add: Schedule a recurring (every) or one-shot (at) task.\n"
         "- cron_list: List all scheduled cron jobs.\n"
         "- cron_remove: Remove a cron job by ID.\n"
-        "- wechat_send: Send a message to a WeChat user proactively.\n\n"
-        "For cron with WeChat delivery, set channel='wechat' and a valid chat_id.\n\n");
+        "- wechat_send: Send a message to a WeChat user proactively.\n"
+        "- Built-in MiMo web_search is available for current information when needed.\n\n"
+        "cron_add automatically delivers notifications back to the channel and chat where the request originated.\n\n");
 
     // Memory
     off += snprintf(buf + off, bufSize - off,

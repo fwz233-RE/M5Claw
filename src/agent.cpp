@@ -4,6 +4,7 @@
 #include "context_builder.h"
 #include "session_mgr.h"
 #include "message_bus.h"
+#include "media_utils.h"
 #include "wechat_bot.h"
 #include "m5claw_config.h"
 #include <ArduinoJson.h>
@@ -15,6 +16,9 @@
 
 struct AgentRequest {
     char* text;
+    char mediaPath[96];
+    char mediaMime[32];
+    uint8_t mediaKind;
     char channel[16];
     char chatId[96];
     char msgId[64];
@@ -35,6 +39,9 @@ static char s_extConvChannel[16] = {0};
 
 static JsonDocument** s_freeable_messages = nullptr;
 static AgentTokenCallback s_activeTokenCb = nullptr;
+
+static const char* kMediaPlaceholderPrefix = "__M5CLAW_MEDIA|";
+static const char* kMediaPlaceholderSuffix = "__";
 
 static void* alloc_prefer_psram(size_t size) {
     void* p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -87,29 +94,87 @@ static bool restoreMessagesFromSwap(JsonDocument** messagesPtr) {
     return true;
 }
 
-static char* stripMarkdownBold(const char* text) {
-    if (!text) return nullptr;
-    size_t len = strlen(text);
-    char* out = (char*)malloc(len + 1);
-    if (!out) return nullptr;
-    size_t j = 0;
-    for (size_t i = 0; i < len; ) {
-        if (i + 1 < len && text[i] == '*' && text[i + 1] == '*') {
-            i += 2;
-        } else if (text[i] == '#') {
-            i++;
-        } else {
-            out[j++] = text[i++];
-        }
+static bool buildMediaPlaceholder(const char* path, const char* mimeType,
+                                  char* out, size_t outSize) {
+    if (!path || !path[0] || !out || outSize == 0) return false;
+    const char* mime = (mimeType && mimeType[0]) ? mimeType : MediaUtils::guessMimeType(path);
+    int written = snprintf(out, outSize, "%s%s|%s%s",
+                           kMediaPlaceholderPrefix, mime, path, kMediaPlaceholderSuffix);
+    return written > 0 && (size_t)written < outSize;
+}
+
+static String summarizeRequest(const AgentRequest& req) {
+    String summary = (req.text && req.text[0]) ? String(req.text) : String();
+    if (req.mediaKind == BUS_MEDIA_AUDIO) {
+        if (summary.length() > 0) summary += " ";
+        summary += "[voice]";
+    } else if (req.mediaKind == BUS_MEDIA_IMAGE) {
+        if (summary.length() > 0) summary += " ";
+        summary += "[image]";
     }
-    out[j] = '\0';
-    return out;
+    if (summary.length() == 0) summary = "[input]";
+    return summary;
+}
+
+static bool appendRequestUserMessage(JsonDocument& messages, const AgentRequest& req) {
+    JsonObject userMsg = messages.as<JsonArray>().add<JsonObject>();
+    userMsg["role"] = "user";
+
+    if (req.mediaKind == BUS_MEDIA_NONE) {
+        userMsg["content"] = (req.text && req.text[0]) ? req.text : "";
+        return true;
+    }
+
+    JsonArray content = userMsg["content"].to<JsonArray>();
+    if (req.text && req.text[0]) {
+        JsonObject textPart = content.add<JsonObject>();
+        textPart["type"] = "text";
+        textPart["text"] = req.text;
+    }
+
+    char mediaPlaceholder[196];
+    if (!buildMediaPlaceholder(req.mediaPath, req.mediaMime,
+                               mediaPlaceholder, sizeof(mediaPlaceholder))) {
+        Serial.printf("[AGENT] Failed to build media placeholder for %s\n", req.mediaPath);
+        return false;
+    }
+
+    if (req.mediaKind == BUS_MEDIA_AUDIO) {
+        JsonObject audioPart = content.add<JsonObject>();
+        audioPart["type"] = "input_audio";
+        JsonObject inputAudio = audioPart["input_audio"].to<JsonObject>();
+        inputAudio["data"] = mediaPlaceholder;
+    } else if (req.mediaKind == BUS_MEDIA_IMAGE) {
+        JsonObject imagePart = content.add<JsonObject>();
+        imagePart["type"] = "image_url";
+        JsonObject imageUrl = imagePart["image_url"].to<JsonObject>();
+        imageUrl["url"] = mediaPlaceholder;
+    }
+    return content.size() > 0;
+}
+
+static bool buildInitialMessages(const char* sessionId, const AgentRequest& req, JsonDocument** outMessages) {
+    *outMessages = nullptr;
+    String histJson = SessionMgr::getHistoryJson(sessionId, M5CLAW_AGENT_MAX_HISTORY);
+    void* messagesMem = alloc_prefer_psram(sizeof(JsonDocument));
+    JsonDocument* messages = messagesMem ? new (messagesMem) JsonDocument : nullptr;
+    if (!messages) return false;
+    deserializeJson(*messages, histJson);
+    histJson = "";
+    if (!appendRequestUserMessage(*messages, req)) {
+        messages->~JsonDocument();
+        heap_caps_free(messages);
+        return false;
+    }
+    *outMessages = messages;
+    return true;
 }
 
 #define TOOL_OUTPUT_SIZE (8 * 1024)
 
 static void processRequest(AgentRequest& req, char* system_prompt, char* tool_output) {
-    Serial.printf("[AGENT] Processing (ch=%s): %.200s\n", req.channel, req.text);
+    String reqSummary = summarizeRequest(req);
+    Serial.printf("[AGENT] Processing (ch=%s): %.200s\n", req.channel, reqSummary.c_str());
 
     if (s_abortRequested) {
         Serial.println("[AGENT] Aborted before processing");
@@ -117,7 +182,7 @@ static void processRequest(AgentRequest& req, char* system_prompt, char* tool_ou
         if (strcmp(req.channel, M5CLAW_CHAN_LOCAL) != 0) {
             free(s_extConvUser);
             free(s_extConvAI);
-            s_extConvUser = strdup(req.text);
+            s_extConvUser = strdup(reqSummary.c_str());
             s_extConvAI = strdup("[cancelled]");
             strlcpy(s_extConvChannel, req.channel, sizeof(s_extConvChannel));
             s_extConvReady = true;
@@ -128,30 +193,20 @@ static void processRequest(AgentRequest& req, char* system_prompt, char* tool_ou
     ContextBuilder::buildSystemPrompt(system_prompt, M5CLAW_CONTEXT_BUF_SIZE);
 
     const char* sessionId = req.chatId[0] ? req.chatId : "local";
-    String histJson = SessionMgr::getHistoryJson(sessionId, M5CLAW_AGENT_MAX_HISTORY);
-
-    void* messagesMem = alloc_prefer_psram(sizeof(JsonDocument));
-    JsonDocument* messages = messagesMem ? new (messagesMem) JsonDocument : nullptr;
-    if (!messages) {
-        if (req.callback) req.callback("Agent out of memory.");
+    JsonDocument* messages = nullptr;
+    if (!buildInitialMessages(sessionId, req, &messages)) {
+        const char* errText = "Failed to prepare MiMo request.";
+        if (req.callback) req.callback(errText);
         if (req.exCallback) {
-            AgentResponseInfo info = {"Agent out of memory.", req.channel, req.chatId};
+            AgentResponseInfo info = {errText, req.channel, req.chatId};
             req.exCallback(&info);
         }
         return;
     }
 
-    deserializeJson(*messages, histJson);
-    histJson = "";
-
-    JsonObject userMsg = messages->as<JsonArray>().add<JsonObject>();
-    userMsg["role"] = "user";
-    userMsg["content"] = req.text;
-
     const char* tools_json = ToolRegistry::getToolsJson();
     char* final_text = nullptr;
     int iteration = 0;
-    int retryCount = 0;
 
     while (iteration < M5CLAW_AGENT_MAX_TOOL_ITER) {
         if (s_abortRequested) {
@@ -162,42 +217,29 @@ static void processRequest(AgentRequest& req, char* system_prompt, char* tool_ou
         LlmResponse resp;
         memset(&resp, 0, sizeof(resp));
         bool ok = false;
+        int retryCount = 0;
 
         for (;;) {
             if (s_abortRequested) break;
 
             if (retryCount > 0) {
-                char retryMsg[64];
-                snprintf(retryMsg, sizeof(retryMsg),
-                         "\xe9\x87\x8d\xe8\xaf\x95\xe4\xb8\xad... (%d/10)", retryCount);
-                Serial.printf("[AGENT] %s\n", retryMsg);
-                if (req.callback) req.callback(retryMsg);
-                
+                Serial.printf("[AGENT] Retrying MiMo request (%d/10)\n", retryCount);
                 delay(2000);
             }
 
             if (messages == nullptr) {
                 if (!restoreMessagesFromSwap(&messages)) {
-                    void* newMem = alloc_prefer_psram(sizeof(JsonDocument));
-                    messages = newMem ? new (newMem) JsonDocument : nullptr;
-                    if (!messages) {
+                    if (!buildInitialMessages(sessionId, req, &messages)) {
                         Serial.println("[AGENT] OOM reconstructing messages for retry");
                         break;
                     }
-                    String freshHist = SessionMgr::getHistoryJson(sessionId, M5CLAW_AGENT_MAX_HISTORY);
-                    deserializeJson(*messages, freshHist);
-                    JsonObject rebuiltUser = messages->as<JsonArray>().add<JsonObject>();
-                    rebuiltUser["role"] = "user";
-                    rebuiltUser["content"] = req.text;
                 }
             }
 
-            const char* iter_tools = (iteration >= M5CLAW_AGENT_MAX_TOOL_ITER - 2)
-                                     ? nullptr : tools_json;
             s_freeable_messages = &messages;
             llm_client_set_pre_read_free(preSwapToSPIFFS);
             s_activeTokenCb = req.tokenCallback;
-            ok = llm_chat_tools(system_prompt, *messages, iter_tools, &resp,
+            ok = llm_chat_tools(system_prompt, *messages, tools_json, &resp,
                                 req.tokenCallback ? llmStreamForwarder : nullptr);
             s_activeTokenCb = nullptr;
             llm_client_set_pre_read_free(nullptr);
@@ -206,10 +248,8 @@ static void processRequest(AgentRequest& req, char* system_prompt, char* tool_ou
             if (ok || s_abortRequested) break;
 
             retryCount++;
-            Serial.printf("[AGENT] LLM failed, retry %d/10\n", retryCount);
             llm_response_free(&resp);
             memset(&resp, 0, sizeof(resp));
-
             if (retryCount >= 10) break;
         }
 
@@ -220,7 +260,7 @@ static void processRequest(AgentRequest& req, char* system_prompt, char* tool_ou
         }
 
         if (!ok) {
-            Serial.println("[AGENT] LLM failed after all retries");
+            Serial.println("[AGENT] MiMo failed after all retries");
             break;
         }
 
@@ -244,78 +284,40 @@ static void processRequest(AgentRequest& req, char* system_prompt, char* tool_ou
 
         if (messages == nullptr) {
             if (!restoreMessagesFromSwap(&messages)) {
-                void* newMem = alloc_prefer_psram(sizeof(JsonDocument));
-                messages = newMem ? new (newMem) JsonDocument : nullptr;
-                if (!messages) {
+                if (!buildInitialMessages(sessionId, req, &messages)) {
                     Serial.println("[AGENT] OOM reconstructing messages for tool iteration");
                     llm_response_free(&resp);
                     break;
                 }
-                String freshHist = SessionMgr::getHistoryJson(sessionId, M5CLAW_AGENT_MAX_HISTORY);
-                deserializeJson(*messages, freshHist);
-                JsonObject rebuiltUser = messages->as<JsonArray>().add<JsonObject>();
-                rebuiltUser["role"] = "user";
-                rebuiltUser["content"] = req.text;
             }
         }
 
         JsonObject asstMsg = messages->as<JsonArray>().add<JsonObject>();
         asstMsg["role"] = "assistant";
-        JsonArray asstContent = asstMsg["content"].to<JsonArray>();
-
-        bool copiedRawContent = false;
-        if (resp.raw_content_json && resp.raw_content_json[0]) {
-            JsonDocument rawContentDoc;
-            if (deserializeJson(rawContentDoc, resp.raw_content_json) == DeserializationError::Ok) {
-                JsonArray rawContent = rawContentDoc.as<JsonArray>();
-                if (!rawContent.isNull()) {
-                    for (JsonVariant block : rawContent) asstContent.add(block);
-                    copiedRawContent = true;
-                }
-            }
+        if (resp.text && resp.text_len > 0) {
+            asstMsg["content"] = resp.text;
+        } else {
+            asstMsg["content"] = "";
         }
+        JsonArray toolCalls = asstMsg["tool_calls"].to<JsonArray>();
 
-        if (!copiedRawContent) {
-            if (resp.text && resp.text_len > 0) {
-                JsonObject tb = asstContent.add<JsonObject>();
-                tb["type"] = "text";
-                tb["text"] = resp.text;
-            }
-            for (int i = 0; i < resp.call_count; i++) {
-                JsonObject tu = asstContent.add<JsonObject>();
-                tu["type"] = "tool_use";
-                tu["id"] = resp.calls[i].id;
-                tu["name"] = resp.calls[i].name;
-                JsonDocument inputDoc;
-                deserializeJson(inputDoc, resp.calls[i].input ? resp.calls[i].input : "{}");
-                tu["input"] = inputDoc;
-            }
-        }
-
-        JsonObject resultMsg = messages->as<JsonArray>().add<JsonObject>();
-        resultMsg["role"] = "user";
-        JsonArray resultContent = resultMsg["content"].to<JsonArray>();
-
-        bool searchDone = false;
         for (int i = 0; i < resp.call_count; i++) {
+            JsonObject tc = toolCalls.add<JsonObject>();
+            tc["id"] = resp.calls[i].id;
+            tc["type"] = "function";
+            JsonObject func = tc["function"].to<JsonObject>();
+            func["name"] = resp.calls[i].name;
+            func["arguments"] = resp.calls[i].input ? resp.calls[i].input : "{}";
+
             tool_output[0] = '\0';
-            bool isSearch = strcmp(resp.calls[i].name, "web_search") == 0;
-            if (isSearch && searchDone) {
-                strlcpy(tool_output,
-                        "\xe8\xaf\xb7\xe9\x80\x90\xe4\xb8\xaa\xe6\x90\x9c\xe7\xb4\xa2\xef\xbc\x8c"
-                        "\xe6\xaf\x8f\xe6\xac\xa1\xe5\x8f\xaa\xe6\x90\x9c\xe7\xb4\xa2\xe4\xb8\x80"
-                        "\xe4\xb8\xaa\xe4\xb8\xbb\xe9\xa2\x98\xe3\x80\x82",
-                        TOOL_OUTPUT_SIZE);
-            } else {
-                ToolRegistry::execute(resp.calls[i].name,
-                                      resp.calls[i].input ? resp.calls[i].input : "{}",
-                                      tool_output, TOOL_OUTPUT_SIZE);
-                if (isSearch) searchDone = true;
-            }
-            JsonObject tr = resultContent.add<JsonObject>();
-            tr["type"] = "tool_result";
-            tr["tool_use_id"] = resp.calls[i].id;
-            tr["content"] = tool_output;
+            ToolRegistry::execute(resp.calls[i].name,
+                                  resp.calls[i].input ? resp.calls[i].input : "{}",
+                                  tool_output, TOOL_OUTPUT_SIZE);
+
+            JsonObject toolMsg = messages->as<JsonArray>().add<JsonObject>();
+            toolMsg["role"] = "tool";
+            toolMsg["tool_call_id"] = resp.calls[i].id;
+            toolMsg["content"] = tool_output;
         }
 
         llm_response_free(&resp);
@@ -335,10 +337,10 @@ static void processRequest(AgentRequest& req, char* system_prompt, char* tool_ou
         Serial.println("[AGENT] Request was aborted");
     }
 
-    const char* responseText = (final_text && final_text[0]) ? final_text : "\xe8\xaf\xb7\xe6\xb1\x82\xe5\xa4\xb1\xe8\xb4\xa5\xef\xbc\x8c\xe8\xaf\xb7\xe9\x87\x8d\xe8\xaf\x95\xe3\x80\x82";
+    const char* responseText = (final_text && final_text[0]) ? final_text : "请求失败，请重试。";
 
     if (!wasAborted && final_text && final_text[0]) {
-        SessionMgr::appendMessage(sessionId, "user", req.text);
+        SessionMgr::appendMessage(sessionId, "user", reqSummary.c_str());
         SessionMgr::appendMessage(sessionId, "assistant", final_text);
     }
 
@@ -353,7 +355,7 @@ static void processRequest(AgentRequest& req, char* system_prompt, char* tool_ou
     if (fromBus || strcmp(req.channel, M5CLAW_CHAN_LOCAL) != 0) {
         free(s_extConvUser);
         free(s_extConvAI);
-        s_extConvUser = strdup(req.text);
+        s_extConvUser = strdup(reqSummary.c_str());
         s_extConvAI = wasAborted ? strdup("[cancelled]") : strdup(responseText);
         strlcpy(s_extConvChannel, req.channel, sizeof(s_extConvChannel));
         s_extConvReady = true;
@@ -366,11 +368,13 @@ static void busResponseHandler(const AgentResponseInfo* info) {
     if (strcmp(info->channel, M5CLAW_CHAN_LOCAL) == 0) return;
 
     if (strcmp(info->channel, M5CLAW_CHAN_WECHAT) == 0) {
-        char* cleaned = stripMarkdownBold(info->text);
-        WechatBot::sendMessage(info->chatId, cleaned ? cleaned : info->text);
-        free(cleaned);
+        WechatBot::sendMessage(info->chatId, info->text);
         return;
     }
+}
+
+static void cleanupRequestMedia(const AgentRequest& req) {
+    if (req.mediaPath[0]) SPIFFS.remove(req.mediaPath);
 }
 
 static void agent_task(void* arg) {
@@ -381,7 +385,8 @@ static void agent_task(void* arg) {
 
     if (!system_prompt || !tool_output) {
         Serial.println("[AGENT] Failed to allocate working buffers");
-        free(system_prompt); free(tool_output);
+        free(system_prompt);
+        free(tool_output);
         s_ready = false;
         vTaskDelete(nullptr);
         return;
@@ -395,18 +400,18 @@ static void agent_task(void* arg) {
                   (unsigned)uxTaskGetStackHighWaterMark(nullptr));
 
     while (true) {
-        AgentRequest req;
+        AgentRequest req = {};
         bool hasReq = false;
 
-        // Check queue first (local messages have priority)
         if (xQueueReceive(s_queue, &req, pdMS_TO_TICKS(100)) == pdTRUE) {
             hasReq = true;
         } else {
-            // Check message bus (wechat, cron, heartbeat)
-            BusMessage busMsg;
+            BusMessage busMsg = {};
             if (MessageBus::popInbound(&busMsg, 100)) {
-                memset(&req, 0, sizeof(req));
                 req.text = busMsg.content;
+                strlcpy(req.mediaPath, busMsg.media_path, sizeof(req.mediaPath));
+                strlcpy(req.mediaMime, busMsg.media_mime, sizeof(req.mediaMime));
+                req.mediaKind = busMsg.media_kind;
                 strlcpy(req.channel, busMsg.channel, sizeof(req.channel));
                 strlcpy(req.chatId, busMsg.chat_id, sizeof(req.chatId));
                 strlcpy(req.msgId, busMsg.msg_id, sizeof(req.msgId));
@@ -421,16 +426,15 @@ static void agent_task(void* arg) {
         s_busy = true;
         s_abortRequested = false;
 
-        bool isCronNotify = (req.text && strncmp(req.text, "[Cron:", 6) == 0);
+        bool isCronNotify = (req.mediaKind == BUS_MEDIA_NONE &&
+                             req.text && strncmp(req.text, "[Cron:", 6) == 0);
         if (isCronNotify && req.callback == nullptr) {
             Serial.printf("[AGENT] Cron notify (ch=%s): %.80s\n", req.channel, req.text);
 
             if (strcmp(req.channel, M5CLAW_CHAN_WECHAT) == 0 && req.chatId[0]) {
                 bool wxa = WechatBot::isRunning();
                 if (wxa) WechatBot::stop();
-                char* cleaned = stripMarkdownBold(req.text);
-                WechatBot::sendMessage(req.chatId, cleaned ? cleaned : req.text);
-                free(cleaned);
+                WechatBot::sendMessage(req.chatId, req.text);
                 if (wxa) WechatBot::resume();
             }
 
@@ -442,6 +446,7 @@ static void agent_task(void* arg) {
             s_extConvReady = true;
 
             free(req.text);
+            cleanupRequestMedia(req);
             s_busy = false;
             continue;
         }
@@ -466,6 +471,7 @@ static void agent_task(void* arg) {
         }
 
         free(req.text);
+        cleanupRequestMedia(req);
 
         if (wechatWasActive) {
             WechatBot::resume();
@@ -496,16 +502,38 @@ void Agent::sendMessage(const char* text, AgentResponseCallback onResponse,
         if (onResponse) onResponse("Agent unavailable: memory init failed.");
         return;
     }
-    AgentRequest req;
-    memset(&req, 0, sizeof(req));
-    req.text = strdup(text);
+    AgentRequest req = {};
+    req.text = text ? strdup(text) : nullptr;
+    req.mediaKind = BUS_MEDIA_NONE;
     strlcpy(req.channel, M5CLAW_CHAN_LOCAL, sizeof(req.channel));
     strlcpy(req.chatId, "local", sizeof(req.chatId));
     req.callback = onResponse;
     req.exCallback = nullptr;
     req.tokenCallback = onToken;
-    if (!req.text || xQueueSend(s_queue, &req, 0) != pdTRUE) {
+    if ((text && !req.text) || xQueueSend(s_queue, &req, 0) != pdTRUE) {
         free(req.text);
+        if (onResponse) onResponse("Agent queue full, try again.");
+    }
+}
+
+void Agent::sendVoiceMessage(const char* audioPath, const char* mimeType,
+                             AgentResponseCallback onResponse,
+                             AgentTokenCallback onToken) {
+    if (!s_ready) {
+        if (onResponse) onResponse("Agent unavailable: memory init failed.");
+        return;
+    }
+    AgentRequest req = {};
+    req.mediaKind = BUS_MEDIA_AUDIO;
+    strlcpy(req.mediaPath, audioPath ? audioPath : "", sizeof(req.mediaPath));
+    strlcpy(req.mediaMime, mimeType ? mimeType : "audio/wav", sizeof(req.mediaMime));
+    strlcpy(req.channel, M5CLAW_CHAN_LOCAL, sizeof(req.channel));
+    strlcpy(req.chatId, "local", sizeof(req.chatId));
+    req.callback = onResponse;
+    req.exCallback = nullptr;
+    req.tokenCallback = onToken;
+    if (xQueueSend(s_queue, &req, 0) != pdTRUE) {
+        cleanupRequestMedia(req);
         if (onResponse) onResponse("Agent queue full, try again.");
     }
 }

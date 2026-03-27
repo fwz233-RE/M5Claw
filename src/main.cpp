@@ -14,7 +14,6 @@
 #include "memory_store.h"
 #include "session_mgr.h"
 #include "context_builder.h"
-#include "dashscope_stt.h"
 #include "message_bus.h"
 #include "wechat_bot.h"
 #include "cron_service.h"
@@ -23,43 +22,6 @@
 #include <esp_heap_caps.h>
 #include <freertos/queue.h>
 #include "soc/rtc_cntl_reg.h"
-
-#ifndef USER_WIFI_SSID
-#define USER_WIFI_SSID ""
-#endif
-#ifndef USER_WIFI_PASS
-#define USER_WIFI_PASS ""
-#endif
-#ifndef USER_LLM_KEY
-#define USER_LLM_KEY ""
-#endif
-#ifndef USER_LLM_PROVIDER
-#define USER_LLM_PROVIDER ""
-#endif
-#ifndef USER_LLM_MODEL
-#define USER_LLM_MODEL ""
-#endif
-#ifndef USER_DS_KEY
-#define USER_DS_KEY ""
-#endif
-#ifndef USER_CITY
-#define USER_CITY ""
-#endif
-#ifndef USER_LLM_HOST
-#define USER_LLM_HOST ""
-#endif
-#ifndef USER_LLM_PATH
-#define USER_LLM_PATH ""
-#endif
-#ifndef USER_WECHAT_TOKEN
-#define USER_WECHAT_TOKEN ""
-#endif
-#ifndef USER_WECHAT_API_HOST
-#define USER_WECHAT_API_HOST ""
-#endif
-#ifndef USER_GLM_SEARCH_KEY
-#define USER_GLM_SEARCH_KEY ""
-#endif
 
 M5Canvas canvas(&M5Cardputer.Display);
 Companion companion;
@@ -71,8 +33,7 @@ static AppMode appMode = AppMode::SETUP;
 static bool offlineMode = false;
 
 enum class SetupStep {
-    SSID, PASSWORD, LLM_KEY, LLM_PROVIDER, LLM_MODEL,
-    DASHSCOPE_KEY, CITY, CONNECTING
+    SSID, PASSWORD, LLM_KEY, LLM_MODEL, CITY, CONNECTING
 };
 static SetupStep setupStep = SetupStep::SSID;
 static String setupInput;
@@ -80,9 +41,12 @@ static String setupInput;
 static bool voiceRecording = false;
 static unsigned long recordingStartMs = 0;
 
-static const size_t STT_CHUNK_SAMPLES = 1600;
 static int16_t* sttChunkBuf = nullptr;
 static bool s_wechatPausedForVoice = false;
+static File s_voiceFile;
+static size_t s_voicePcmBytes = 0;
+static bool s_voiceWriteFailed = false;
+static bool s_playTtsForNextLocalReply = false;
 
 void enterSetupMode();
 void updateSetupMode();
@@ -95,7 +59,6 @@ void enterChatMode();
 void startVoiceRecording();
 String stopVoiceRecording();
 void streamVoiceData();
-void fillBuildTimeDefaults();
 void processSerialCommands();
 void dispatchOutbound();
 
@@ -109,54 +72,22 @@ static QueueHandle_t s_tokenQueue = nullptr;
 static volatile bool s_hasStreamedTokens = false;
 
 static bool hasPreconfiguredOnlineSettings() {
-    bool hasLlm = Config::getLlmApiKey().length() > 0
-               && Config::getLlmProvider().length() > 0
-               && Config::getLlmModel().length() > 0;
-    bool hasSpeech = Config::getDashScopeKey().length() > 0;
-    return hasLlm || hasSpeech;
-}
-
-static void setIfEmpty(void (*setter)(const String&), const String& current, const char* buildVal) {
-    if (current.length() == 0 && buildVal && buildVal[0])
-        setter(String(buildVal));
-}
-
-void fillBuildTimeDefaults() {
-    setIfEmpty(Config::setSSID,            Config::getSSID(),            USER_WIFI_SSID);
-    setIfEmpty(Config::setPassword,        Config::getPassword(),        USER_WIFI_PASS);
-    setIfEmpty(Config::setLlmApiKey,       Config::getLlmApiKey(),       USER_LLM_KEY);
-    setIfEmpty(Config::setLlmProvider,     Config::getLlmProvider(),     USER_LLM_PROVIDER);
-    setIfEmpty(Config::setLlmModel,        Config::getLlmModel(),        USER_LLM_MODEL);
-    setIfEmpty(Config::setDashScopeKey,    Config::getDashScopeKey(),    USER_DS_KEY);
-    setIfEmpty(Config::setCity,            Config::getCity(),            USER_CITY);
-    setIfEmpty(Config::setLlmHost,         Config::getLlmHost(),         USER_LLM_HOST);
-    setIfEmpty(Config::setLlmPath,         Config::getLlmPath(),         USER_LLM_PATH);
-    setIfEmpty(Config::setWechatToken,     Config::getWechatToken(),     USER_WECHAT_TOKEN);
-    setIfEmpty(Config::setWechatApiHost,  Config::getWechatApiHost(),   USER_WECHAT_API_HOST);
-    setIfEmpty(Config::setGlmSearchKey,    Config::getGlmSearchKey(),    USER_GLM_SEARCH_KEY);
-    if (Config::getLlmProvider().length() == 0) Config::setLlmProvider("anthropic");
-    if (Config::getLlmModel().length() == 0) Config::setLlmModel(M5CLAW_LLM_DEFAULT_MODEL);
-    if (Config::getCity().length() == 0) Config::setCity("Beijing");
+    return Config::getLlmApiKey().length() > 0
+        && Config::getLlmModel().length() > 0;
 }
 
 // ── M5Burner NVS Configure protocol ──────────────────────────
 static const char* const NVS_KEYS[] = {
-    "ssid", "pass", "llm_key", "llm_prov", "llm_model",
-    "llm_host", "llm_path", "ds_key", "city",
-    "glm_key", "wc_token", "wc_host"
+    "ssid", "pass", "llm_key", "llm_model",
+    "city", "wc_token", "wc_host"
 };
 
 static String nvsGet(const char* key) {
     if (strcmp(key, "ssid") == 0)      return Config::getSSID();
     if (strcmp(key, "pass") == 0)      return Config::getPassword();
     if (strcmp(key, "llm_key") == 0)   return Config::getLlmApiKey();
-    if (strcmp(key, "llm_prov") == 0)  return Config::getLlmProvider();
     if (strcmp(key, "llm_model") == 0) return Config::getLlmModel();
-    if (strcmp(key, "llm_host") == 0)  return Config::getLlmHost();
-    if (strcmp(key, "llm_path") == 0)  return Config::getLlmPath();
-    if (strcmp(key, "ds_key") == 0)    return Config::getDashScopeKey();
     if (strcmp(key, "city") == 0)      return Config::getCity();
-    if (strcmp(key, "glm_key") == 0)   return Config::getGlmSearchKey();
     if (strcmp(key, "wc_token") == 0)  return Config::getWechatToken();
     if (strcmp(key, "wc_host") == 0)   return Config::getWechatApiHost();
     return "";
@@ -166,13 +97,8 @@ static void nvsSet(const char* key, const char* value) {
     if (strcmp(key, "ssid") == 0)      Config::setSSID(value);
     else if (strcmp(key, "pass") == 0)      Config::setPassword(value);
     else if (strcmp(key, "llm_key") == 0)   Config::setLlmApiKey(value);
-    else if (strcmp(key, "llm_prov") == 0)  Config::setLlmProvider(value);
     else if (strcmp(key, "llm_model") == 0) Config::setLlmModel(value);
-    else if (strcmp(key, "llm_host") == 0)  Config::setLlmHost(value);
-    else if (strcmp(key, "llm_path") == 0)  Config::setLlmPath(value);
-    else if (strcmp(key, "ds_key") == 0)    Config::setDashScopeKey(value);
     else if (strcmp(key, "city") == 0)      Config::setCity(value);
-    else if (strcmp(key, "glm_key") == 0)   Config::setGlmSearchKey(value);
     else if (strcmp(key, "wc_token") == 0)  Config::setWechatToken(value);
     else if (strcmp(key, "wc_host") == 0)   Config::setWechatApiHost(value);
     Config::save();
@@ -219,17 +145,14 @@ void processSerialCommands() {
 
     if (cmd == "help") {
         Serial.println("=== M5Claw Serial Config ===");
-        Serial.println("  set_wifi <ssid> <pass>   - Set WiFi");
-        Serial.println("  set_llm_key <key>        - Set LLM API key");
-        Serial.println("  set_llm_provider <p>     - anthropic or openai");
-        Serial.println("  set_llm_model <model>    - e.g. claude-sonnet-4-20250514");
-        Serial.println("  set_ds_key <key>         - Set DashScope key");
-        Serial.println("  set_city <city>          - e.g. Beijing");
+        Serial.println("  set_wifi <ssid> <pass>    - Set WiFi");
+        Serial.println("  set_mimo_key <key>        - Set Xiaomi MiMo API key");
+        Serial.println("  set_mimo_model <model>    - Default: mimo-v2-omni");
+        Serial.println("  set_city <city>           - e.g. Beijing");
         Serial.println("  set_wechat <token> <host> - Set WeChat bot credentials");
-        Serial.println("  set_glm_key <key>        - Set Zhipu AI search key");
-        Serial.println("  show_config              - Show current config");
-        Serial.println("  reset_config             - Clear all config");
-        Serial.println("  reboot                   - Restart device");
+        Serial.println("  show_config               - Show current config");
+        Serial.println("  reset_config              - Clear all config");
+        Serial.println("  reboot                    - Restart device");
     } else if (cmd == "set_wifi") {
         int sp = val.indexOf(' ');
         if (sp > 0) {
@@ -240,18 +163,12 @@ void processSerialCommands() {
         } else {
             Serial.println("Usage: set_wifi <ssid> <password>");
         }
-    } else if (cmd == "set_llm_key") {
+    } else if (cmd == "set_mimo_key" || cmd == "set_llm_key") {
         Config::setLlmApiKey(val); Config::save();
-        Serial.println("LLM key saved");
-    } else if (cmd == "set_llm_provider") {
-        Config::setLlmProvider(val); Config::save();
-        Serial.printf("Provider: %s\n", val.c_str());
-    } else if (cmd == "set_llm_model") {
+        Serial.println("MiMo key saved");
+    } else if (cmd == "set_mimo_model" || cmd == "set_llm_model") {
         Config::setLlmModel(val); Config::save();
         Serial.printf("Model: %s\n", val.c_str());
-    } else if (cmd == "set_ds_key") {
-        Config::setDashScopeKey(val); Config::save();
-        Serial.println("DashScope key saved");
     } else if (cmd == "set_city") {
         Config::setCity(val); Config::save();
         Serial.printf("City: %s\n", val.c_str());
@@ -265,21 +182,15 @@ void processSerialCommands() {
         } else {
             Serial.println("Usage: set_wechat <bearer_token> <api_host>");
         }
-    } else if (cmd == "set_glm_key") {
-        Config::setGlmSearchKey(val); Config::save();
-        Serial.println("GLM search key saved");
     } else if (cmd == "show_config") {
         Serial.println("=== Current Config ===");
         Serial.printf("  WiFi SSID:     %s\n", Config::getSSID().c_str());
         Serial.printf("  WiFi Pass:     [%d chars]\n", Config::getPassword().length());
-        Serial.printf("  LLM Provider:  %s\n", Config::getLlmProvider().c_str());
-        Serial.printf("  LLM Model:     %s\n", Config::getLlmModel().c_str());
-        Serial.printf("  LLM Key:       [%d chars]\n", Config::getLlmApiKey().length());
-        Serial.printf("  DashScope Key: [%d chars]\n", Config::getDashScopeKey().length());
+        Serial.printf("  MiMo Model:    %s\n", Config::getLlmModel().c_str());
+        Serial.printf("  MiMo Key:      [%d chars]\n", Config::getLlmApiKey().length());
         Serial.printf("  City:          %s\n", Config::getCity().c_str());
         Serial.printf("  WeChat Token:  [%d chars]\n", Config::getWechatToken().length());
         Serial.printf("  WeChat Host:   %s\n", Config::getWechatApiHost().c_str());
-        Serial.printf("  GLM Search:    [%d chars]\n", Config::getGlmSearchKey().length());
         Serial.printf("  Valid:         %s\n", Config::isValid() ? "YES" : "NO");
     } else if (cmd == "reset_config") {
         Config::reset(); Config::save();
@@ -340,12 +251,12 @@ void setup() {
     Serial.println("[BOOT] Display OK");
 
     Config::load();
-    fillBuildTimeDefaults();
+    MemoryStore::init();
+    Config::importBootstrapFile();
+    Config::applyDefaults();
     Config::save();
     Serial.println("[BOOT] Config loaded");
     Serial.println("[BOOT] Type 'help' in serial monitor for config commands");
-
-    MemoryStore::init();
     Serial.println("[BOOT] SPIFFS OK");
 
     MessageBus::init();
@@ -410,12 +321,17 @@ void loop() {
                 chat.appendAIToken(agentResponseText);
             }
             chat.onAIResponseComplete();
-            companion.triggerIdle();
+            if (s_playTtsForNextLocalReply) {
+                llm_speak_text(agentResponseText);
+            } else {
+                companion.triggerIdle();
+            }
         }
         free(agentResponseText);
         agentResponseText = nullptr;
         agentResponseReady = false;
         s_hasStreamedTokens = false;
+        s_playTtsForNextLocalReply = false;
     }
 
     // External AI response (wechat reply / cron notification / heartbeat)
@@ -534,20 +450,36 @@ void loop() {
                            && !ks.tab && !ks.enter && !ks.del;
 
             if (!offlineMode && fnDown && fnAlone && !voiceRecording
-                && !Agent::isBusy()
-                && Config::getDashScopeKey().length() > 0) {
+                && !Agent::isBusy()) {
                 startVoiceRecording();
             }
             if (fnUp && voiceRecording) {
-                String text = stopVoiceRecording();
-                if (text.length() > 0) chat.setInput(text);
+                String audioPath = stopVoiceRecording();
+                if (!offlineMode && audioPath.length() > 0) {
+                    chat.addMessage("[voice]", true);
+                    chat.addMessage("thinking...", false);
+                    s_hasStreamedTokens = false;
+                    s_playTtsForNextLocalReply = true;
+                    Agent::sendVoiceMessage(audioPath.c_str(), "audio/wav", onAgentResponse, onAgentToken);
+                } else if (audioPath.length() > 0) {
+                    SPIFFS.remove(audioPath.c_str());
+                }
                 didBlock = true;
             }
 
             if (!didBlock && voiceRecording) {
                 streamVoiceData();
-                if (!DashScopeSTT::isStreaming()) {
-                    stopVoiceRecording();
+                if (millis() - recordingStartMs >= M5CLAW_AUDIO_MAX_SECONDS * 1000UL) {
+                    String audioPath = stopVoiceRecording();
+                    if (!offlineMode && audioPath.length() > 0) {
+                        chat.addMessage("[voice]", true);
+                        chat.addMessage("thinking...", false);
+                        s_hasStreamedTokens = false;
+                        s_playTtsForNextLocalReply = true;
+                        Agent::sendVoiceMessage(audioPath.c_str(), "audio/wav", onAgentResponse, onAgentToken);
+                    } else if (audioPath.length() > 0) {
+                        SPIFFS.remove(audioPath.c_str());
+                    }
                     didBlock = true;
                 }
             }
@@ -613,6 +545,7 @@ void loop() {
                     companion.triggerTalk();
 
                     s_hasStreamedTokens = false;
+                    s_playTtsForNextLocalReply = false;
                     Agent::sendMessage(msg.c_str(), onAgentResponse, onAgentToken);
 
                     M5Cardputer.update();
@@ -630,16 +563,9 @@ void loop() {
                 canvas.fillRect(0, SCREEN_H - 16, SCREEN_W, 16, rgb565(200, 50, 50));
                 canvas.setTextColor(Color::WHITE);
                 canvas.setTextSize(1);
-                String partial = DashScopeSTT::getPartialText();
-                if (partial.length() > 0) {
-                    char recLabel[128];
-                    snprintf(recLabel, sizeof(recLabel), "%.0fs %s", dur, partial.c_str());
-                    canvas.drawString(recLabel, 4, SCREEN_H - 12);
-                } else {
-                    char recLabel[32];
-                    snprintf(recLabel, sizeof(recLabel), "Recording... %.1fs", dur);
-                    canvas.drawString(recLabel, 70, SCREEN_H - 12);
-                }
+                char recLabel[40];
+                snprintf(recLabel, sizeof(recLabel), "Recording... %.1fs", dur);
+                canvas.drawString(recLabel, 62, SCREEN_H - 12);
             } else if (Agent::isBusy()) {
                 canvas.fillRect(0, SCREEN_H - 16, SCREEN_W, 16, rgb565(80, 80, 80));
                 canvas.setTextColor(rgb565(200, 200, 200));
@@ -788,17 +714,54 @@ static void onAgentToken(const char* token) {
     }
 }
 
+static void writeWavHeader(File& f, uint32_t pcmBytes, uint32_t sampleRate) {
+    const uint16_t channels = 1;
+    const uint16_t bitsPerSample = 16;
+    const uint32_t byteRate = sampleRate * channels * bitsPerSample / 8;
+    const uint16_t blockAlign = channels * bitsPerSample / 8;
+    const uint32_t riffSize = 36 + pcmBytes;
+
+    f.seek(0);
+    f.write((const uint8_t*)"RIFF", 4);
+    f.write((const uint8_t*)&riffSize, 4);
+    f.write((const uint8_t*)"WAVEfmt ", 8);
+    uint32_t fmtSize = 16;
+    uint16_t audioFormat = 1;
+    f.write((const uint8_t*)&fmtSize, 4);
+    f.write((const uint8_t*)&audioFormat, 2);
+    f.write((const uint8_t*)&channels, 2);
+    f.write((const uint8_t*)&sampleRate, 4);
+    f.write((const uint8_t*)&byteRate, 4);
+    f.write((const uint8_t*)&blockAlign, 2);
+    f.write((const uint8_t*)&bitsPerSample, 2);
+    f.write((const uint8_t*)"data", 4);
+    f.write((const uint8_t*)&pcmBytes, 4);
+}
+
+static bool writeVoiceBytes(const void* data, size_t len) {
+    if (!s_voiceFile || !data || len == 0) return false;
+    size_t written = s_voiceFile.write((const uint8_t*)data, len);
+    if (written != len) {
+        s_voiceWriteFailed = true;
+        Serial.printf("[VOICE] File write short: %u/%u bytes, spiffs used=%u total=%u\n",
+                      (unsigned)written, (unsigned)len,
+                      (unsigned)SPIFFS.usedBytes(), (unsigned)SPIFFS.totalBytes());
+    }
+    s_voicePcmBytes += written;
+    return written == len;
+}
+
 void startVoiceRecording() {
     if (WechatBot::isRunning()) {
-        WechatBot::stop();
+        WechatBot::requestPause();
         s_wechatPausedForVoice = true;
-        Serial.printf("[VOICE] WeChat paused for STT, heap=%d\n", ESP.getFreeHeap());
+        Serial.printf("[VOICE] WeChat paused for audio capture, heap=%d\n", ESP.getFreeHeap());
     }
 
-    M5Cardputer.Speaker.end();
+    M5Cardputer.Speaker.stop();
 
     if (!sttChunkBuf) {
-        sttChunkBuf = (int16_t*)malloc(STT_CHUNK_SAMPLES * sizeof(int16_t));
+        sttChunkBuf = (int16_t*)malloc(M5CLAW_AUDIO_CHUNK_SAMPLES * sizeof(int16_t));
     }
     if (!sttChunkBuf) {
         Serial.println("[VOICE] Failed to alloc chunk buffer");
@@ -807,45 +770,55 @@ void startVoiceRecording() {
     }
 
     auto micCfg = M5Cardputer.Mic.config();
-    micCfg.sample_rate = M5CLAW_STT_SAMPLE_RATE;
+    micCfg.sample_rate = M5CLAW_AUDIO_RECORD_SAMPLE_RATE;
     micCfg.magnification = 64;
     micCfg.noise_filter_level = 64;
     micCfg.task_priority = 1;
     M5Cardputer.Mic.config(micCfg);
     M5Cardputer.Mic.begin();
 
-    chat.update(canvas);
-    canvas.fillRect(0, SCREEN_H - 16, SCREEN_W, 16, rgb565(50, 50, 200));
-    canvas.setTextColor(Color::WHITE);
-    canvas.setTextSize(1);
-    canvas.drawString("Connecting...", 80, SCREEN_H - 12);
-    canvas.pushSprite(0, 0);
-
-    if (!DashScopeSTT::beginStream()) {
-        Serial.println("[VOICE] STT stream failed");
+    if (s_voiceFile) s_voiceFile.close();
+    SPIFFS.remove(M5CLAW_AUDIO_TEMP_FILE);
+    s_voiceFile = SPIFFS.open(M5CLAW_AUDIO_TEMP_FILE, "w");
+    if (!s_voiceFile) {
+        Serial.println("[VOICE] Failed to open temp wav file");
         M5Cardputer.Mic.end();
         free(sttChunkBuf); sttChunkBuf = nullptr;
         if (s_wechatPausedForVoice) { WechatBot::resume(); s_wechatPausedForVoice = false; }
         return;
     }
+    uint8_t blankHeader[44] = {0};
+    s_voiceWriteFailed = false;
+    if (s_voiceFile.write(blankHeader, sizeof(blankHeader)) != sizeof(blankHeader)) {
+        s_voiceWriteFailed = true;
+        Serial.printf("[VOICE] Header write failed, spiffs used=%u total=%u\n",
+                      (unsigned)SPIFFS.usedBytes(), (unsigned)SPIFFS.totalBytes());
+    }
+    s_voicePcmBytes = 0;
 
-    memset(sttChunkBuf, 0, STT_CHUNK_SAMPLES * sizeof(int16_t));
-    M5Cardputer.Mic.record(sttChunkBuf, STT_CHUNK_SAMPLES, M5CLAW_STT_SAMPLE_RATE);
+    chat.update(canvas);
+    canvas.fillRect(0, SCREEN_H - 16, SCREEN_W, 16, rgb565(50, 50, 200));
+    canvas.setTextColor(Color::WHITE);
+    canvas.setTextSize(1);
+    canvas.drawString("Recording...", 82, SCREEN_H - 12);
+    canvas.pushSprite(0, 0);
+
+    memset(sttChunkBuf, 0, M5CLAW_AUDIO_CHUNK_SAMPLES * sizeof(int16_t));
+    M5Cardputer.Mic.record(sttChunkBuf, M5CLAW_AUDIO_CHUNK_SAMPLES, M5CLAW_AUDIO_RECORD_SAMPLE_RATE);
     voiceRecording = true;
     recordingStartMs = millis();
-    Serial.printf("[VOICE] Streaming started, heap=%d\n", ESP.getFreeHeap());
+    Serial.printf("[VOICE] Recording started, heap=%d\n", ESP.getFreeHeap());
 }
 
 void streamVoiceData() {
-    if (!voiceRecording || !sttChunkBuf) return;
+    if (!voiceRecording || !sttChunkBuf || !s_voiceFile) return;
 
     if (!M5Cardputer.Mic.isRecording()) {
-        DashScopeSTT::feedAudio(sttChunkBuf, STT_CHUNK_SAMPLES);
-        memset(sttChunkBuf, 0, STT_CHUNK_SAMPLES * sizeof(int16_t));
-        M5Cardputer.Mic.record(sttChunkBuf, STT_CHUNK_SAMPLES, M5CLAW_STT_SAMPLE_RATE);
+        size_t chunkBytes = M5CLAW_AUDIO_CHUNK_SAMPLES * sizeof(int16_t);
+        writeVoiceBytes(sttChunkBuf, chunkBytes);
+        memset(sttChunkBuf, 0, chunkBytes);
+        M5Cardputer.Mic.record(sttChunkBuf, M5CLAW_AUDIO_CHUNK_SAMPLES, M5CLAW_AUDIO_RECORD_SAMPLE_RATE);
     }
-
-    DashScopeSTT::poll();
 }
 
 String stopVoiceRecording() {
@@ -854,11 +827,13 @@ String stopVoiceRecording() {
 
     M5Cardputer.Mic.end();
 
-    if (sttChunkBuf) {
-        DashScopeSTT::feedAudio(sttChunkBuf, STT_CHUNK_SAMPLES);
+    if (sttChunkBuf && s_voiceFile) {
+        size_t chunkBytes = M5CLAW_AUDIO_CHUNK_SAMPLES * sizeof(int16_t);
+        writeVoiceBytes(sttChunkBuf, chunkBytes);
+        writeWavHeader(s_voiceFile, s_voicePcmBytes, M5CLAW_AUDIO_RECORD_SAMPLE_RATE);
+        s_voiceFile.flush();
+        s_voiceFile.close();
     }
-
-    String result = DashScopeSTT::endStream();
 
     free(sttChunkBuf);
     sttChunkBuf = nullptr;
@@ -870,8 +845,31 @@ String stopVoiceRecording() {
     }
 
     float duration = (float)(millis() - recordingStartMs) / 1000.0f;
-    Serial.printf("[VOICE] Done, %.2fs, result: %s\n", duration, result.c_str());
-    return result;
+    if (duration < 0.3f || s_voicePcmBytes == 0) {
+        SPIFFS.remove(M5CLAW_AUDIO_TEMP_FILE);
+        Serial.printf("[VOICE] Discarded short recording %.2fs\n", duration);
+        return "";
+    }
+
+    size_t savedFileBytes = 0;
+    File verify = SPIFFS.open(M5CLAW_AUDIO_TEMP_FILE, "r");
+    if (verify) {
+        savedFileBytes = verify.size();
+        verify.close();
+    }
+
+    Serial.printf("[VOICE] Saved %.2fs audio to %s (%u bytes pcm, file=%u, writeFailed=%d)\n",
+                  duration, M5CLAW_AUDIO_TEMP_FILE, (unsigned)s_voicePcmBytes,
+                  (unsigned)savedFileBytes, s_voiceWriteFailed);
+
+    if (s_voiceWriteFailed || savedFileBytes <= 44 || savedFileBytes != s_voicePcmBytes + 44) {
+        Serial.printf("[VOICE] Invalid temp wav, expected=%u actual=%u\n",
+                      (unsigned)(s_voicePcmBytes + 44), (unsigned)savedFileBytes);
+        SPIFFS.remove(M5CLAW_AUDIO_TEMP_FILE);
+        return "";
+    }
+
+    return M5CLAW_AUDIO_TEMP_FILE;
 }
 
 void enterSetupMode() {
@@ -909,10 +907,8 @@ void updateSetupMode() {
     switch (setupStep) {
         case SetupStep::SSID:        label = "WiFi SSID:";     currentVal = Config::getSSID();         break;
         case SetupStep::PASSWORD:    label = "WiFi Password:";  currentVal = Config::getPassword();     isPass = true; break;
-        case SetupStep::LLM_KEY:     label = "LLM API Key:";   currentVal = Config::getLlmApiKey();    isPass = true; break;
-        case SetupStep::LLM_PROVIDER:label = "Provider(anthropic/openai):"; currentVal = Config::getLlmProvider(); break;
-        case SetupStep::LLM_MODEL:   label = "LLM Model:";     currentVal = Config::getLlmModel();     break;
-        case SetupStep::DASHSCOPE_KEY:label= "DashScope Key:";  currentVal = Config::getDashScopeKey(); isPass = true; break;
+        case SetupStep::LLM_KEY:     label = "MiMo API Key:";  currentVal = Config::getLlmApiKey();    isPass = true; break;
+        case SetupStep::LLM_MODEL:   label = "MiMo Model:";    currentVal = Config::getLlmModel();     break;
         case SetupStep::CITY:        label = "City:";           currentVal = Config::getCity();          break;
         case SetupStep::CONNECTING:
             canvas.drawString("Connecting to WiFi...", 50, 55);
@@ -958,7 +954,7 @@ void updateSetupMode() {
         totalSteps = 2;
     } else {
         stepNum = (int)setupStep + 1;
-        totalSteps = 7;
+        totalSteps = 5;
     }
     char progress[16];
     snprintf(progress, sizeof(progress), "Step %d/%d", stepNum, totalSteps);
@@ -1006,17 +1002,10 @@ void handleSetupKey(char key, bool enter, bool backspace, bool tab) {
             break;
         case SetupStep::LLM_KEY:
             if (setupInput.length() > 0) Config::setLlmApiKey(setupInput);
-            setupInput = ""; setupStep = SetupStep::LLM_PROVIDER; break;
-        case SetupStep::LLM_PROVIDER:
-            if (setupInput.length() > 0) Config::setLlmProvider(setupInput);
-            if (Config::getLlmProvider().length() == 0) Config::setLlmProvider("anthropic");
             setupInput = ""; setupStep = SetupStep::LLM_MODEL; break;
         case SetupStep::LLM_MODEL:
             if (setupInput.length() > 0) Config::setLlmModel(setupInput);
             if (Config::getLlmModel().length() == 0) Config::setLlmModel(M5CLAW_LLM_DEFAULT_MODEL);
-            setupInput = ""; setupStep = SetupStep::DASHSCOPE_KEY; break;
-        case SetupStep::DASHSCOPE_KEY:
-            if (setupInput.length() > 0) Config::setDashScopeKey(setupInput);
             setupInput = ""; setupStep = SetupStep::CITY; break;
         case SetupStep::CITY:
             if (setupInput.length() > 0) Config::setCity(setupInput);
@@ -1118,13 +1107,7 @@ void initOnlineServices() {
 
     llm_client_init(Config::getLlmApiKey().c_str(),
                     Config::getLlmModel().c_str(),
-                    Config::getLlmProvider().c_str(),
-                    Config::getLlmHost().c_str(),
-                    Config::getLlmPath().c_str());
-
-    if (Config::getDashScopeKey().length() > 0) {
-        DashScopeSTT::init(Config::getDashScopeKey().c_str());
-    }
+                    nullptr, nullptr, nullptr);
 
     weatherClient.begin(Config::getCity());
     Agent::start();

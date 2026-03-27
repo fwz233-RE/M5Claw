@@ -2,6 +2,9 @@
 #include "m5claw_config.h"
 #include "config.h"
 #include "message_bus.h"
+#include "media_utils.h"
+#include "tls_utils.h"
+#include <SPIFFS.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
@@ -15,9 +18,15 @@ static char s_token[512]       = {0};
 static char s_api_host[128]    = {0};
 static char s_uin_b64[24]      = {0};
 static char s_update_buf[512]  = {0};
-static char s_last_ctx[256]    = {0};
 static char s_last_uid[128]   = {0};
 static uint32_t s_msg_seq      = 0;
+
+struct WechatContextEntry {
+    char userId[128];
+    char contextToken[256];
+};
+
+static WechatContextEntry s_ctxCache[6] = {};
 
 static TaskHandle_t s_task     = nullptr;
 static bool s_running          = false;
@@ -62,6 +71,29 @@ static void generateUin() {
     s_uin_b64[olen] = '\0';
 }
 
+static void rememberContextToken(const char* userId, const char* contextToken) {
+    if (!userId || !userId[0] || !contextToken || !contextToken[0]) return;
+    int freeIdx = -1;
+    for (int i = 0; i < (int)(sizeof(s_ctxCache) / sizeof(s_ctxCache[0])); i++) {
+        if (strcmp(s_ctxCache[i].userId, userId) == 0) {
+            strlcpy(s_ctxCache[i].contextToken, contextToken, sizeof(s_ctxCache[i].contextToken));
+            return;
+        }
+        if (freeIdx < 0 && s_ctxCache[i].userId[0] == '\0') freeIdx = i;
+    }
+    int idx = (freeIdx >= 0) ? freeIdx : (esp_random() % (sizeof(s_ctxCache) / sizeof(s_ctxCache[0])));
+    strlcpy(s_ctxCache[idx].userId, userId, sizeof(s_ctxCache[idx].userId));
+    strlcpy(s_ctxCache[idx].contextToken, contextToken, sizeof(s_ctxCache[idx].contextToken));
+}
+
+static const char* findContextToken(const char* userId) {
+    if (!userId || !userId[0]) return "";
+    for (const auto& entry : s_ctxCache) {
+        if (strcmp(entry.userId, userId) == 0) return entry.contextToken;
+    }
+    return "";
+}
+
 /* ── DNS + HTTPS helper ────────────────────────────── */
 static bool resolveHost(const char* host, IPAddress& ip) {
     if (WiFi.status() != WL_CONNECTED) return false;
@@ -78,12 +110,11 @@ static String httpsPostRaw(const char* host, const char* path, const char* body,
 
     WiFiClientSecure* client = new WiFiClientSecure();
     if (!client) { Serial.println("[WECHAT] OOM for TLS client"); return ""; }
-    client->setInsecure();
-    client->setTimeout(timeoutMs);
+    TlsConfig::configureClient(*client, timeoutMs);
 
     IPAddress ip;
     if (!resolveHost(host, ip)) { Serial.printf("[WECHAT] DNS failed: %s\n", host); delete client; return ""; }
-    if (!client->connect(ip, 443)) { Serial.println("[WECHAT] Connect failed"); delete client; return ""; }
+    if (!client->connect(host, 443)) { Serial.println("[WECHAT] Connect failed"); delete client; return ""; }
 
     client->printf("POST %s HTTP/1.0\r\n", path);
     client->printf("Host: %s\r\n", host);
@@ -135,12 +166,11 @@ static String httpsGet(const char* host, const char* path, int timeoutMs = 15000
 
     WiFiClientSecure* client = new WiFiClientSecure();
     if (!client) return "";
-    client->setInsecure();
-    client->setTimeout(timeoutMs);
+    TlsConfig::configureClient(*client, timeoutMs);
 
     IPAddress ip;
     if (!resolveHost(host, ip)) { Serial.printf("[WECHAT] DNS failed: %s\n", host); delete client; return ""; }
-    if (!client->connect(ip, 443)) { Serial.println("[WECHAT] GET connect failed"); delete client; return ""; }
+    if (!client->connect(host, 443)) { Serial.println("[WECHAT] GET connect failed"); delete client; return ""; }
 
     client->printf("GET %s HTTP/1.0\r\n", path);
     client->printf("Host: %s\r\n", host);
@@ -181,6 +211,58 @@ static int findJsonStart(const String& resp) {
     return (i >= 0) ? i : -1;
 }
 
+static void enqueueDisplayText(const char* text) {
+    if (!text || !text[0]) return;
+    int next = (s_displayHead + 1) % WX_DISPLAY_QUEUE_SIZE;
+    if (next == s_displayTail) {
+        free(s_displayQueue[s_displayTail]);
+        s_displayQueue[s_displayTail] = nullptr;
+        s_displayTail = (s_displayTail + 1) % WX_DISPLAY_QUEUE_SIZE;
+    }
+    s_displayQueue[s_displayHead] = strdup(text);
+    s_displayHead = next;
+}
+
+static const char* findStringField(JsonObject obj, const char* const* fields, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        const char* value = obj[fields[i]] | "";
+        if (value[0]) return value;
+    }
+    return "";
+}
+
+static bool extractImageCandidate(JsonObject item, String& imageUrl, String& mimeType) {
+    static const char* const directFields[] = {
+        "image_url", "download_url", "url", "cdn_url", "origin_url", "thumb_url", "pic_url"
+    };
+    static const char* const mimeFields[] = {
+        "mime_type", "content_type", "file_type"
+    };
+    static const char* const objectFields[] = {
+        "image_item", "pic_item", "media_item", "file_item"
+    };
+
+    const char* direct = findStringField(item, directFields, sizeof(directFields) / sizeof(directFields[0]));
+    if (direct[0]) {
+        imageUrl = direct;
+        mimeType = findStringField(item, mimeFields, sizeof(mimeFields) / sizeof(mimeFields[0]));
+        return true;
+    }
+
+    for (size_t i = 0; i < sizeof(objectFields) / sizeof(objectFields[0]); i++) {
+        JsonObject nested = item[objectFields[i]];
+        if (nested.isNull()) continue;
+        const char* nestedUrl = findStringField(nested, directFields, sizeof(directFields) / sizeof(directFields[0]));
+        if (nestedUrl[0]) {
+            imageUrl = nestedUrl;
+            mimeType = findStringField(nested, mimeFields, sizeof(mimeFields) / sizeof(mimeFields[0]));
+            return true;
+        }
+    }
+
+    return false;
+}
+
 /* ── Handle incoming message ─────────────────────────── */
 static void handleIncomingMessage(JsonObject msg) {
     int msgType = msg["message_type"] | 0;
@@ -192,7 +274,7 @@ static void handleIncomingMessage(JsonObject msg) {
 
     if (!fromUserId[0]) return;
 
-    if (contextToken[0]) strlcpy(s_last_ctx, contextToken, sizeof(s_last_ctx));
+    rememberContextToken(fromUserId, contextToken);
     strlcpy(s_last_uid, fromUserId, sizeof(s_last_uid));
 
     char dedupKey[64];
@@ -202,34 +284,76 @@ static void handleIncomingMessage(JsonObject msg) {
     JsonArray items = msg["item_list"];
     if (items.isNull()) return;
 
+    String messageText;
+    char imagePath[96] = {0};
+    char imageMime[32] = {0};
+    bool hasImage = false;
+
     for (JsonVariant itemVar : items) {
         JsonObject item = itemVar.as<JsonObject>();
         int type = item["type"] | 0;
-        if (type != 1) continue;
-
-        JsonObject textItem = item["text_item"];
-        if (textItem.isNull()) continue;
-        const char* text = textItem["text"] | "";
-        if (!text[0]) continue;
-
-        Serial.printf("[WECHAT] Msg from %s: %.200s\n", fromUserId, text);
-
-        int next = (s_displayHead + 1) % WX_DISPLAY_QUEUE_SIZE;
-        if (next == s_displayTail) {
-            free(s_displayQueue[s_displayTail]);
-            s_displayQueue[s_displayTail] = nullptr;
-            s_displayTail = (s_displayTail + 1) % WX_DISPLAY_QUEUE_SIZE;
+        if (type == 1) {
+            JsonObject textItem = item["text_item"];
+            if (textItem.isNull()) continue;
+            const char* text = textItem["text"] | "";
+            if (!text[0]) continue;
+            if (messageText.length() > 0) messageText += "\n";
+            messageText += text;
+            continue;
         }
-        s_displayQueue[s_displayHead] = strdup(text);
-        s_displayHead = next;
 
-        BusMessage busMsg = {};
-        strlcpy(busMsg.channel, M5CLAW_CHAN_WECHAT, sizeof(busMsg.channel));
-        strlcpy(busMsg.chat_id, fromUserId, sizeof(busMsg.chat_id));
-        snprintf(busMsg.msg_id, sizeof(busMsg.msg_id), "%d", messageId);
-        busMsg.content = strdup(text);
-        if (busMsg.content) {
-            if (!MessageBus::pushInbound(&busMsg)) free(busMsg.content);
+        if (!hasImage) {
+            String imageUrl;
+            String mimeType;
+            if (extractImageCandidate(item, imageUrl, mimeType) && imageUrl.length() > 0) {
+                snprintf(imagePath, sizeof(imagePath), "/tmp_wx_%d.bin",
+                         messageId ? messageId : (int)millis());
+                if (MediaUtils::downloadHttpsUrlToFile(imageUrl.c_str(), imagePath,
+                                                       imageMime, sizeof(imageMime),
+                                                       M5CLAW_WECHAT_MEDIA_MAX_BYTES)) {
+                    if (!imageMime[0] && mimeType.length() > 0) {
+                        strlcpy(imageMime, mimeType.c_str(), sizeof(imageMime));
+                    }
+                    hasImage = true;
+                    continue;
+                }
+                Serial.printf("[WECHAT] Image download failed: %s\n", imageUrl.c_str());
+            }
+        }
+
+        String raw;
+        serializeJson(item, raw);
+        if (raw.length() > 180) raw = raw.substring(0, 180);
+        Serial.printf("[WECHAT] Unsupported item type=%d raw=%s\n", type, raw.c_str());
+    }
+
+    if (messageText.length() == 0 && !hasImage) return;
+
+    String preview = messageText;
+    if (hasImage) {
+        if (preview.length() > 0) preview += " ";
+        preview += "[image]";
+    }
+    if (preview.length() == 0) preview = "[image]";
+
+    Serial.printf("[WECHAT] Msg from %s: %.200s\n", fromUserId, preview.c_str());
+    enqueueDisplayText(preview.c_str());
+
+    BusMessage busMsg = {};
+    strlcpy(busMsg.channel, M5CLAW_CHAN_WECHAT, sizeof(busMsg.channel));
+    strlcpy(busMsg.chat_id, fromUserId, sizeof(busMsg.chat_id));
+    snprintf(busMsg.msg_id, sizeof(busMsg.msg_id), "%d", messageId);
+    if (messageText.length() > 0) busMsg.content = strdup(messageText.c_str());
+    if (hasImage) {
+        strlcpy(busMsg.media_path, imagePath, sizeof(busMsg.media_path));
+        strlcpy(busMsg.media_mime, imageMime[0] ? imageMime : "image/jpeg", sizeof(busMsg.media_mime));
+        busMsg.media_kind = BUS_MEDIA_IMAGE;
+    }
+
+    if (busMsg.content || busMsg.media_kind != BUS_MEDIA_NONE) {
+        if (!MessageBus::pushInbound(&busMsg)) {
+            free(busMsg.content);
+            if (busMsg.media_path[0]) SPIFFS.remove(busMsg.media_path);
         }
     }
 }
@@ -372,9 +496,15 @@ void WechatBot::stop() {
                   ESP.getFreeHeap(), (int)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 }
 
+void WechatBot::requestPause() {
+    if (!s_running) return;
+    s_stopRequested = true;
+}
+
 void WechatBot::resume() {
-    if (!s_running || !s_stopped) return;
+    if (!s_running) return;
     s_stopRequested = false;
+    if (!s_stopped) return;
     unsigned long t = millis();
     while (s_stopped && millis() - t < 1000) delay(50);
     Serial.println("[WECHAT] Resumed");
@@ -401,7 +531,8 @@ bool WechatBot::sendMessage(const char* userId, const char* text) {
         msg["client_id"] = clientId;
         msg["message_type"] = 2;
         msg["message_state"] = 2;
-        if (s_last_ctx[0]) msg["context_token"] = s_last_ctx;
+        const char* ctx = findContextToken(userId);
+        if (ctx[0]) msg["context_token"] = ctx;
         JsonArray itemList = msg["item_list"].to<JsonArray>();
         JsonObject item = itemList.add<JsonObject>();
         item["type"] = 1;

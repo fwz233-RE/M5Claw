@@ -1,4 +1,5 @@
 #include "weather_client.h"
+#include "tls_utils.h"
 #include <WiFiClientSecure.h>
 #include <WiFi.h>
 #include <ArduinoJson.h>
@@ -127,7 +128,7 @@ bool WeatherClient::resolveCity(const String& city) {
     }
 
     WiFiClientSecure client;
-    client.setInsecure();
+    TlsConfig::configureClient(client, HTTP_TIMEOUT_MS);
 
     if (!client.connect("geocoding-api.open-meteo.com", 443)) {
         Serial.println("[WEATHER] Geocoding connection failed");
@@ -188,7 +189,7 @@ bool WeatherClient::resolveCity(const String& city) {
 
 bool WeatherClient::fetchWeather() {
     WiFiClientSecure client;
-    client.setInsecure();
+    TlsConfig::configureClient(client, HTTP_TIMEOUT_MS);
 
     if (!client.connect("api.open-meteo.com", 443)) {
         Serial.println("[WEATHER] Weather API connection failed");

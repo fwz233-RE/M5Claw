@@ -8,18 +8,19 @@
 #define M5CLAW_AGENT_MAX_TOOL_ITER     10
 #define M5CLAW_MAX_TOOL_CALLS          4
 
-// LLM
-#define M5CLAW_LLM_DEFAULT_MODEL       "claude-sonnet-4.6"
-#define M5CLAW_LLM_PROVIDER_DEFAULT    "anthropic"
+// Xiaomi MiMo
+#define M5CLAW_LLM_DEFAULT_MODEL       "mimo-v2-omni"
 #define M5CLAW_LLM_MAX_TOKENS          4096
-#define M5CLAW_LLM_ANTHROPIC_URL       "api.anthropic.com"
-#define M5CLAW_LLM_ANTHROPIC_PATH      "/v1/messages"
-#define M5CLAW_LLM_OPENAI_URL          "api.openai.com"
-#define M5CLAW_LLM_OPENAI_PATH         "/v1/chat/completions"
-#define M5CLAW_LLM_API_VERSION         "2023-06-01"
-#define M5CLAW_LLM_RESPONSE_BUF        (4 * 1024)
-#define M5CLAW_SSE_LINE_BUF            1024
+#define M5CLAW_MIMO_HOST               "api.xiaomimimo.com"
+#define M5CLAW_MIMO_CHAT_PATH          "/v1/chat/completions"
+#define M5CLAW_MIMO_TTS_MODEL          "mimo-v2-tts"
+#define M5CLAW_MIMO_TTS_VOICE          "mimo_default"
+#define M5CLAW_MIMO_TTS_SAMPLE_RATE    24000
+#define M5CLAW_MIMO_SEARCH_MAX_KEYWORD 3
+#define M5CLAW_MIMO_SEARCH_LIMIT       5
+#define M5CLAW_SSE_LINE_BUF            2048
 #define M5CLAW_LLM_TEXT_MAX            (8 * 1024)
+#define M5CLAW_TTS_TEXT_MAX            240
 
 // Agent SPIFFS swap
 #define M5CLAW_AGENT_SWAP_FILE         "/tmp_msgs.json"
@@ -27,6 +28,7 @@
 // Memory / SPIFFS  (SPIFFS.open() auto-prepends mount point "/spiffs")
 #define M5CLAW_SOUL_FILE               "/config/SOUL.md"
 #define M5CLAW_USER_FILE               "/config/USER.md"
+#define M5CLAW_BOOTSTRAP_CONFIG_FILE   "/config/BOOTSTRAP.json"
 #define M5CLAW_MEMORY_FILE             "/memory/MEMORY.md"
 #define M5CLAW_MEMORY_DIR              "/memory"
 #define M5CLAW_SESSION_DIR             "/sessions"
@@ -46,12 +48,7 @@
 #define M5CLAW_WECHAT_API_CONFIG       "/ilink/bot/getconfig"
 #define M5CLAW_WECHAT_QR_PATH          "/ilink/bot/get_bot_qrcode?bot_type=3"
 #define M5CLAW_WECHAT_QR_STATUS_PATH   "/ilink/bot/get_qrcode_status?qrcode="
-
-// GLM Web Search (Zhipu AI)
-#define M5CLAW_SEARCH_HOST             "open.bigmodel.cn"
-#define M5CLAW_SEARCH_PATH             "/api/paas/v4/web_search"
-#define M5CLAW_SEARCH_ENGINE           "search_std"
-#define M5CLAW_SEARCH_MAX_RESULTS      5
+#define M5CLAW_WECHAT_MEDIA_MAX_BYTES  (2 * 1024 * 1024)
 
 // Cron Service
 #define M5CLAW_CRON_FILE               "/cron.json"
@@ -73,15 +70,13 @@
 #define M5CLAW_CHAN_WECHAT             "wechat"
 #define M5CLAW_CHAN_SYSTEM              "system"
 
-// DashScope STT
-#define M5CLAW_STT_WS_HOST             "dashscope.aliyuncs.com"
-#define M5CLAW_STT_WS_PORT             443
-#define M5CLAW_STT_WS_PATH             "/api-ws/v1/inference"
-#define M5CLAW_STT_MODEL               "fun-asr-realtime"
-#define M5CLAW_STT_SAMPLE_RATE         16000
-#define M5CLAW_STT_CHUNK_MS            100
-#define M5CLAW_STT_MAX_SECONDS         120
-
+// Local audio capture / temp media
+#define M5CLAW_AUDIO_RECORD_SAMPLE_RATE 16000
+#define M5CLAW_AUDIO_CHUNK_SAMPLES      1600
+#define M5CLAW_AUDIO_MAX_SECONDS        10
+#define M5CLAW_AUDIO_TEMP_FILE          "/tmp_voice.wav"
+#define M5CLAW_MEDIA_TEMP_PREFIX        "/tmp_"
+#define M5CLAW_MEDIA_DATA_URI_MAX       (3 * 1024 * 1024)
 
 // NTP
 #define M5CLAW_NTP_SERVER              "pool.ntp.org"

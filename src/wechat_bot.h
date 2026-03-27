@@ -5,6 +5,7 @@ namespace WechatBot {
     void init();
     void start();
     void stop();
+    void requestPause();
     void resume();
     bool sendMessage(const char* userId, const char* text);
     bool sendTyping(const char* userId, int status);

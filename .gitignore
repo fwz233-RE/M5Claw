@@ -11,6 +11,7 @@ mimi_secrets.h
 *.env
 .env*
 user_config.ini
+data/config/BOOTSTRAP.json
 
 # Python 缓存
 __pycache__/
@@ -18,12 +19,14 @@ __pycache__/
 
 # 编译产物
 build/
+dist/
 *.bin
 *.elf
 *.map
 *.hex
 firmware.bin
 spiffs.bin
+!data/cert/x509_crt_bundle.bin
 
 # 操作系统文件
 .DS_Store

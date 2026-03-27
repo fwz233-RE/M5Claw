@@ -36,3 +36,5 @@ bool llm_chat_tools(const char* system_prompt,
                     const char* tools_json,
                     LlmResponse* resp,
                     LlmStreamCallback on_token = nullptr);
+
+bool llm_speak_text(const char* text);

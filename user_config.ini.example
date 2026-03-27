@@ -4,8 +4,10 @@
 ; 使用方法：
 ;   1. 复制此文件为 user_config.ini
 ;   2. 填入你的配置
-;   3. 编译烧录：pio run -t upload
-;   配置会在首次启动时自动写入设备 NVS
+;   3. 运行 flash.py，或至少执行：
+;      pio run -t upload
+;      pio run -t uploadfs
+;   配置会先写入 SPIFFS 的引导文件，并在首次启动时导入到设备 NVS 后删除
 ;
 ; 注意：user_config.ini 已在 .gitignore 中，不会上传到 GitHub
 ; ==============================================
@@ -15,21 +17,10 @@
 wifi_ssid = 
 wifi_pass = 
 
-; LLM 配置（必填其一）
-; 支持 anthropic 或 openai
-llm_provider = anthropic
-llm_model = claude-sonnet-4-20250514
-llm_api_key = 
-
-; DashScope 配置（选填，语音识别和语音合成需要）
-; 获取地址：https://bailian.console.aliyun.com/#/api-key
-dashscope_key = 
+; Xiaomi MiMo 配置（必填）
+; 文档：https://platform.xiaomimimo.com/#/docs/quick-start/first-api-call
+mimo_model = mimo-v2-omni
+mimo_api_key = 
 
 ; 天气城市（选填，英文）
 city = Beijing
-
-; WeChat Bot 配置（选填）
-; 通过 npx -y @tencent-weixin/openclaw-weixin-cli@latest install 获取凭证
-; 或在设备串口执行 set_wechat <token> <api_host>
-wechat_token =
-wechat_api_host =

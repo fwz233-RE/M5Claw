@@ -1,12 +1,16 @@
 #include "llm_client.h"
-#include "config.h"
+#include "m5claw_config.h"
+#include "tls_utils.h"
+#include <M5Cardputer.h>
+#include <SPIFFS.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
 #include <esp_heap_caps.h>
+#include <mbedtls/base64.h>
 
 static char s_api_key[320] = {0};
 static char s_model[64] = M5CLAW_LLM_DEFAULT_MODEL;
-static char s_provider[16] = M5CLAW_LLM_PROVIDER_DEFAULT;
 static char s_custom_host[128] = {0};
 static char s_custom_path[128] = {0};
 
@@ -15,8 +19,41 @@ static bool is_aborted() { return s_abort_flag && *s_abort_flag; }
 
 static LlmPreReadFreeFn s_pre_read_free_fn = nullptr;
 
+static const char* kMediaPlaceholderPrefix = "__M5CLAW_MEDIA|";
+static const char* kMediaPlaceholderSuffix = "__";
+static constexpr int kMaxRequestMediaRefs = 4;
+static constexpr size_t kErrorBodyPreviewMax = 4096;
+
+struct RequestMediaRef {
+    size_t pos;
+    size_t token_len;
+    size_t replacement_len;
+    char mime[48];
+    char path[128];
+};
+
+struct HttpResponseMeta {
+    int status_code;
+    bool chunked;
+    char content_type[64];
+};
+
 void llm_client_set_abort_flag(volatile bool* flag) { s_abort_flag = flag; }
 void llm_client_set_pre_read_free(LlmPreReadFreeFn fn) { s_pre_read_free_fn = fn; }
+
+static const char* llm_host() {
+    return s_custom_host[0] ? s_custom_host : M5CLAW_MIMO_HOST;
+}
+
+static const char* llm_path() {
+    return s_custom_path[0] ? s_custom_path : M5CLAW_MIMO_CHAT_PATH;
+}
+
+static void* alloc_prefer_psram(size_t size) {
+    void* p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) p = heap_caps_malloc(size, MALLOC_CAP_8BIT);
+    return p;
+}
 
 static void safe_copy(char* dst, size_t sz, const char* src) {
     if (!dst || !sz) return;
@@ -26,63 +63,14 @@ static void safe_copy(char* dst, size_t sz, const char* src) {
     dst[n] = '\0';
 }
 
-static bool provider_is_openai() { return strcmp(s_provider, "openai") == 0; }
-
-static const char* llm_host() {
-    if (s_custom_host[0]) return s_custom_host;
-    return provider_is_openai() ? M5CLAW_LLM_OPENAI_URL : M5CLAW_LLM_ANTHROPIC_URL;
-}
-static const char* llm_path() {
-    if (s_custom_path[0]) return s_custom_path;
-    return provider_is_openai() ? M5CLAW_LLM_OPENAI_PATH : M5CLAW_LLM_ANTHROPIC_PATH;
-}
-
-static bool resolve_host(const char* host, IPAddress& ip, const char* tag) {
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.printf("%s WiFi not connected\n", tag);
-        return false;
-    }
-    for (int attempt = 1; attempt <= 2; attempt++) {
-        if (WiFi.hostByName(host, ip)) {
-            Serial.printf("%s DNS %s -> %s\n", tag, host, ip.toString().c_str());
-            return true;
-        }
-        Serial.printf("%s DNS failed (%d/2)\n", tag, attempt);
-        delay(100);
-    }
-    return false;
-}
-
-static bool secure_connect(WiFiClientSecure& client, const char* host, uint16_t port, const char* tag) {
-    IPAddress ip;
-    if (!resolve_host(host, ip, tag)) return false;
-    client.setInsecure();
-    client.setTimeout(30000);
-    for (int attempt = 1; attempt <= 2; attempt++) {
-        if (client.connect(ip, port)) {
-            return true;
-        }
-        Serial.printf("%s connect failed (%d/2)\n", tag, attempt);
-        delay(200);
-    }
-    return false;
-}
-
-static void* alloc_prefer_psram(size_t size) {
-    void* p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!p) p = heap_caps_malloc(size, MALLOC_CAP_8BIT);
-    return p;
-}
-
 void llm_client_init(const char* api_key, const char* model, const char* provider,
                      const char* custom_host, const char* custom_path) {
+    (void)provider;
     if (api_key && api_key[0]) safe_copy(s_api_key, sizeof(s_api_key), api_key);
     if (model && model[0]) safe_copy(s_model, sizeof(s_model), model);
-    if (provider && provider[0]) safe_copy(s_provider, sizeof(s_provider), provider);
     if (custom_host && custom_host[0]) safe_copy(s_custom_host, sizeof(s_custom_host), custom_host);
     if (custom_path && custom_path[0]) safe_copy(s_custom_path, sizeof(s_custom_path), custom_path);
-    Serial.printf("[LLM] Init provider=%s model=%s host=%s path=%s\n",
-                  s_provider, s_model, llm_host(), llm_path());
+    Serial.printf("[LLM] Init MiMo model=%s host=%s path=%s\n", s_model, llm_host(), llm_path());
 }
 
 void llm_response_free(LlmResponse* resp) {
@@ -99,18 +87,47 @@ void llm_response_free(LlmResponse* resp) {
     resp->tool_use = false;
 }
 
-// ── HTTP header parser with chunked encoding detection ────────
+static bool resolve_host(const char* host, IPAddress& ip, const char* tag) {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.printf("%s WiFi not connected\n", tag);
+        return false;
+    }
+    for (int attempt = 1; attempt <= 2; attempt++) {
+        if (WiFi.hostByName(host, ip)) {
+            Serial.printf("%s DNS %s -> %s\n", tag, host, ip.toString().c_str());
+            return true;
+        }
+        delay(100);
+    }
+    return false;
+}
 
-static bool skip_http_headers(WiFiClientSecure& client, bool* out_chunked) {
-    *out_chunked = false;
-    char hdr[128];
+static bool secure_connect(WiFiClientSecure& client, const char* host, uint16_t port, const char* tag) {
+    IPAddress ip;
+    if (!resolve_host(host, ip, tag)) return false;
+    TlsConfig::configureClient(client, 30000);
+    for (int attempt = 1; attempt <= 2; attempt++) {
+        if (client.connect(host, port)) return true;
+        Serial.printf("%s connect failed (%d/2)\n", tag, attempt);
+        delay(200);
+    }
+    return false;
+}
+
+static bool read_http_headers(WiFiClientSecure& client, HttpResponseMeta* meta) {
+    if (!meta) return false;
+    meta->status_code = 0;
+    meta->chunked = false;
+    meta->content_type[0] = '\0';
+    char hdr[256];
     int hp = 0;
     int state = 0;
+    bool firstLine = true;
     while (client.connected()) {
         if (is_aborted()) return false;
         if (!client.available()) { delay(10); continue; }
         char c = client.read();
-        if (c != '\r' && c != '\n' && hp < 126) hdr[hp++] = c;
+        if (c != '\r' && c != '\n' && hp < (int)sizeof(hdr) - 1) hdr[hp++] = c;
         switch (state) {
             case 0: state = (c == '\r') ? 1 : (c == '\n') ? 2 : 0; break;
             case 1: state = (c == '\n') ? 2 : (c == '\r') ? 1 : 0; break;
@@ -119,18 +136,27 @@ static bool skip_http_headers(WiFiClientSecure& client, bool* out_chunked) {
         }
         if (c == '\n') {
             hdr[hp] = '\0';
-            if (strncasecmp(hdr, "transfer-encoding:", 18) == 0) {
+            if (firstLine) {
+                firstLine = false;
+                const char* sp = strchr(hdr, ' ');
+                if (sp) meta->status_code = atoi(sp + 1);
+            } else if (strncasecmp(hdr, "transfer-encoding:", 18) == 0) {
                 const char* v = hdr + 18;
                 while (*v == ' ') v++;
-                if (strncasecmp(v, "chunked", 7) == 0) *out_chunked = true;
+                if (strncasecmp(v, "chunked", 7) == 0) meta->chunked = true;
+            } else if (strncasecmp(hdr, "content-type:", 13) == 0) {
+                const char* v = hdr + 13;
+                while (*v == ' ') v++;
+                size_t n = strcspn(v, ";");
+                if (n >= sizeof(meta->content_type)) n = sizeof(meta->content_type) - 1;
+                memcpy(meta->content_type, v, n);
+                meta->content_type[n] = '\0';
             }
             hp = 0;
         }
     }
     return false;
 }
-
-// ── Chunked transfer encoding reader ──────────────────────────
 
 struct ChunkedReader {
     WiFiClientSecure& client;
@@ -200,8 +226,6 @@ private:
     }
 };
 
-// ── SSE line reader ───────────────────────────────────────────
-
 static bool read_sse_line(ChunkedReader& reader, char* buf, int maxLen) {
     int pos = 0;
     while (pos < maxLen - 1) {
@@ -213,8 +237,6 @@ static bool read_sse_line(ChunkedReader& reader, char* buf, int maxLen) {
     buf[pos] = '\0';
     return true;
 }
-
-// ── Text accumulator (capped at M5CLAW_LLM_TEXT_MAX) ─────────
 
 static bool text_append(LlmResponse* resp, const char* str, size_t len) {
     if (!len) return true;
@@ -233,28 +255,225 @@ static bool text_append(LlmResponse* resp, const char* str, size_t len) {
     return true;
 }
 
-// ── Request body builders ─────────────────────────────────────
+static bool str_contains_nocase(const char* haystack, const char* needle) {
+    if (!haystack || !needle || !needle[0]) return false;
+    size_t needleLen = strlen(needle);
+    for (const char* p = haystack; *p; ++p) {
+        if (strncasecmp(p, needle, needleLen) == 0) return true;
+    }
+    return false;
+}
 
-static void build_anthropic_body(JsonDocument& doc, const char* system_prompt,
-                                  JsonDocument& messages, const char* tools_json) {
-    doc["model"] = s_model;
-    doc["max_tokens"] = M5CLAW_LLM_MAX_TOKENS;
-    doc["stream"] = true;
-    doc["system"] = system_prompt;
+static bool parse_media_placeholder(const String& body, size_t tokenPos, RequestMediaRef* outRef) {
+    if (!outRef) return false;
+    size_t prefixLen = strlen(kMediaPlaceholderPrefix);
+    size_t suffixLen = strlen(kMediaPlaceholderSuffix);
+    size_t bodyLen = body.length();
+    if (tokenPos + prefixLen >= bodyLen) return false;
+    if (body.substring(tokenPos, tokenPos + prefixLen) != kMediaPlaceholderPrefix) return false;
 
-    JsonArray msgs = doc["messages"].to<JsonArray>();
-    JsonArray src = messages.as<JsonArray>();
-    for (JsonVariant v : src) msgs.add(v);
+    size_t mimeSep = body.indexOf('|', tokenPos + prefixLen);
+    if (mimeSep == (size_t)-1) return false;
+    size_t suffixPos = body.indexOf(kMediaPlaceholderSuffix, mimeSep + 1);
+    if (suffixPos == (size_t)-1) return false;
+    if (suffixPos <= mimeSep + 1) return false;
 
-    if (tools_json) {
-        JsonDocument toolsDoc;
-        deserializeJson(toolsDoc, tools_json);
-        doc["tools"] = toolsDoc.as<JsonArray>();
+    String mime = body.substring(tokenPos + prefixLen, mimeSep);
+    String path = body.substring(mimeSep + 1, suffixPos);
+    if (mime.isEmpty() || path.isEmpty()) return false;
+    if (mime.length() >= sizeof(outRef->mime) || path.length() >= sizeof(outRef->path)) return false;
+
+    strlcpy(outRef->mime, mime.c_str(), sizeof(outRef->mime));
+    strlcpy(outRef->path, path.c_str(), sizeof(outRef->path));
+    outRef->pos = tokenPos;
+    outRef->token_len = (suffixPos + suffixLen) - tokenPos;
+
+    File f = SPIFFS.open(outRef->path, "r");
+    if (!f) {
+        Serial.printf("[LLM] Media file open failed: %s\n", outRef->path);
+        return false;
+    }
+    size_t fileSize = f.size();
+    f.close();
+    if (fileSize == 0) {
+        Serial.printf("[LLM] Media file is empty: %s\n", outRef->path);
+        return false;
+    }
+    Serial.printf("[LLM] Media file %s size=%u mime=%s\n",
+                  outRef->path, (unsigned)fileSize, outRef->mime);
+
+    size_t base64Len = 4 * ((fileSize + 2) / 3);
+    outRef->replacement_len = strlen("data:;base64,") + strlen(outRef->mime) + base64Len;
+    if (outRef->replacement_len > M5CLAW_MEDIA_DATA_URI_MAX) {
+        Serial.printf("[LLM] Media data URI too large: %u\n", (unsigned)outRef->replacement_len);
+        return false;
+    }
+    return true;
+}
+
+static bool collect_request_media_refs(const String& body,
+                                       RequestMediaRef* refs,
+                                       int* outCount,
+                                       size_t* outContentLen) {
+    if (!outCount || !outContentLen) return false;
+    *outCount = 0;
+    *outContentLen = body.length();
+
+    size_t prefixLen = strlen(kMediaPlaceholderPrefix);
+    int from = 0;
+    while (true) {
+        int found = body.indexOf(kMediaPlaceholderPrefix, from);
+        if (found < 0) return true;
+        if (*outCount >= kMaxRequestMediaRefs) {
+            Serial.println("[LLM] Too many media attachments in one request");
+            return false;
+        }
+
+        RequestMediaRef ref = {};
+        if (!parse_media_placeholder(body, (size_t)found, &ref)) {
+            Serial.println("[LLM] Invalid media placeholder");
+            return false;
+        }
+
+        refs[*outCount] = ref;
+        (*outCount)++;
+        if (ref.replacement_len >= ref.token_len) {
+            *outContentLen += ref.replacement_len - ref.token_len;
+        } else {
+            *outContentLen -= ref.token_len - ref.replacement_len;
+        }
+        from = (int)(ref.pos + ref.token_len);
     }
 }
 
+static bool write_all(WiFiClientSecure& client, const char* data, size_t len, size_t* written_total = nullptr) {
+    size_t sent = 0;
+    while (sent < len) {
+        if (is_aborted()) return false;
+        size_t wrote = client.write((const uint8_t*)data + sent, len - sent);
+        if (wrote == 0) {
+            delay(1);
+            if (!client.connected()) return false;
+            continue;
+        }
+        sent += wrote;
+    }
+    if (written_total) *written_total += sent;
+    return true;
+}
+
+static bool write_media_data_uri(WiFiClientSecure& client, const RequestMediaRef& ref, size_t* written_total = nullptr) {
+    File f = SPIFFS.open(ref.path, "r");
+    if (!f) {
+        Serial.printf("[LLM] Media file open failed during send: %s\n", ref.path);
+        return false;
+    }
+
+    char prefix[80];
+    int prefixLen = snprintf(prefix, sizeof(prefix), "data:%s;base64,", ref.mime);
+    if (prefixLen <= 0 || prefixLen >= (int)sizeof(prefix)) {
+        f.close();
+        return false;
+    }
+    if (!write_all(client, prefix, prefixLen, written_total)) {
+        f.close();
+        return false;
+    }
+
+    uint8_t rawBuf[768 + 2];
+    unsigned char encBuf[4 * ((sizeof(rawBuf) + 2) / 3) + 4];
+    size_t carry = 0;
+
+    while (!is_aborted()) {
+        size_t got = f.read(rawBuf + carry, sizeof(rawBuf) - carry);
+        if (got == 0) break;
+
+        size_t total = carry + got;
+        size_t chunkLen = (total / 3) * 3;
+        if (chunkLen > 0) {
+            size_t encLen = 0;
+            if (mbedtls_base64_encode(encBuf, sizeof(encBuf), &encLen, rawBuf, chunkLen) != 0) {
+                f.close();
+                return false;
+            }
+            if (!write_all(client, (const char*)encBuf, encLen, written_total)) {
+                f.close();
+                return false;
+            }
+        }
+
+        carry = total - chunkLen;
+        if (carry > 0) {
+            memmove(rawBuf, rawBuf + chunkLen, carry);
+        }
+    }
+
+    if (carry > 0) {
+        size_t encLen = 0;
+        if (mbedtls_base64_encode(encBuf, sizeof(encBuf), &encLen, rawBuf, carry) != 0) {
+            f.close();
+            return false;
+        }
+        if (!write_all(client, (const char*)encBuf, encLen, written_total)) {
+            f.close();
+            return false;
+        }
+    }
+
+    f.close();
+    return !is_aborted();
+}
+
+static bool send_request_body(WiFiClientSecure& client, const String& body, size_t* outContentLen = nullptr, size_t* outSentLen = nullptr) {
+    RequestMediaRef refs[kMaxRequestMediaRefs];
+    int refCount = 0;
+    size_t contentLen = 0;
+    if (!collect_request_media_refs(body, refs, &refCount, &contentLen)) return false;
+    if (outContentLen) *outContentLen = contentLen;
+    if (outSentLen) *outSentLen = 0;
+
+    client.printf("Content-Length: %u\r\n", (unsigned)contentLen);
+    client.println("Connection: close");
+    client.println();
+
+    if (refCount == 0) {
+        return write_all(client, body.c_str(), body.length(), outSentLen);
+    }
+
+    size_t cursor = 0;
+    for (int i = 0; i < refCount; i++) {
+        const RequestMediaRef& ref = refs[i];
+        if (ref.pos < cursor || ref.pos > body.length()) return false;
+        if (!write_all(client, body.c_str() + cursor, ref.pos - cursor, outSentLen)) return false;
+        if (!write_media_data_uri(client, ref, outSentLen)) return false;
+        cursor = ref.pos + ref.token_len;
+    }
+
+    if (cursor < body.length()) {
+        if (!write_all(client, body.c_str() + cursor, body.length() - cursor, outSentLen)) return false;
+    }
+    return true;
+}
+
+static void build_tool_response_json(LlmResponse* resp) {
+    if (resp->call_count <= 0) return;
+    JsonDocument doc;
+    JsonArray arr = doc.to<JsonArray>();
+    for (int i = 0; i < resp->call_count; i++) {
+        JsonObject tc = arr.add<JsonObject>();
+        tc["id"] = resp->calls[i].id;
+        tc["name"] = resp->calls[i].name;
+        JsonDocument args;
+        deserializeJson(args, resp->calls[i].input ? resp->calls[i].input : "{}");
+        tc["arguments"] = args.as<JsonVariant>();
+    }
+    String raw;
+    serializeJson(arr, raw);
+    resp->raw_content_json = strdup(raw.c_str());
+}
+
 static void build_openai_body(JsonDocument& doc, const char* system_prompt,
-                               JsonDocument& messages, const char* tools_json) {
+                              JsonDocument& messages, const char* tools_json) {
     doc["model"] = s_model;
     doc["max_completion_tokens"] = M5CLAW_LLM_MAX_TOKENS;
     doc["stream"] = true;
@@ -267,11 +486,17 @@ static void build_openai_body(JsonDocument& doc, const char* system_prompt,
     JsonArray src = messages.as<JsonArray>();
     for (JsonVariant v : src) msgs.add(v);
 
-    if (tools_json) {
+    JsonArray dstTools = doc["tools"].to<JsonArray>();
+    JsonObject webSearch = dstTools.add<JsonObject>();
+    webSearch["type"] = "web_search";
+    webSearch["max_keyword"] = M5CLAW_MIMO_SEARCH_MAX_KEYWORD;
+    webSearch["force_search"] = false;
+    webSearch["limit"] = M5CLAW_MIMO_SEARCH_LIMIT;
+
+    if (tools_json && tools_json[0]) {
         JsonDocument toolsDoc;
         deserializeJson(toolsDoc, tools_json);
         JsonArray srcTools = toolsDoc.as<JsonArray>();
-        JsonArray dstTools = doc["tools"].to<JsonArray>();
         for (JsonVariant t : srcTools) {
             JsonObject wrap = dstTools.add<JsonObject>();
             wrap["type"] = "function";
@@ -280,127 +505,11 @@ static void build_openai_body(JsonDocument& doc, const char* system_prompt,
             if (t["description"]) func["description"] = t["description"];
             if (t["input_schema"]) func["parameters"] = t["input_schema"];
         }
-        doc["tool_choice"] = "auto";
     }
 }
-
-// ── Build raw_content_json from streamed data ─────────────────
-
-static void build_raw_content_json(LlmResponse* resp) {
-    JsonDocument doc;
-    JsonArray arr = doc.to<JsonArray>();
-
-    if (resp->text && resp->text_len > 0) {
-        JsonObject tb = arr.add<JsonObject>();
-        tb["type"] = "text";
-        tb["text"] = resp->text;
-    }
-    for (int i = 0; i < resp->call_count; i++) {
-        JsonObject tu = arr.add<JsonObject>();
-        tu["type"] = "tool_use";
-        tu["id"] = resp->calls[i].id;
-        tu["name"] = resp->calls[i].name;
-        JsonDocument inputDoc;
-        deserializeJson(inputDoc, resp->calls[i].input ? resp->calls[i].input : "{}");
-        tu["input"] = inputDoc;
-    }
-
-    String raw;
-    serializeJson(arr, raw);
-    resp->raw_content_json = strdup(raw.c_str());
-}
-
-// ── Anthropic SSE stream processor ────────────────────────────
-
-static bool process_anthropic_stream(ChunkedReader& reader, LlmResponse* resp,
-                                      LlmStreamCallback on_token) {
-    char* line = (char*)alloc_prefer_psram(M5CLAW_SSE_LINE_BUF);
-    if (!line) return false;
-
-    String tool_inputs[M5CLAW_MAX_TOOL_CALLS];
-    int current_tool_idx = -1;
-    bool got_response = false;
-
-    while (!is_aborted()) {
-        if (!read_sse_line(reader, line, M5CLAW_SSE_LINE_BUF)) break;
-
-        if (strncmp(line, "data: ", 6) != 0) continue;
-        const char* json = line + 6;
-
-        JsonDocument chunk;
-        if (deserializeJson(chunk, json) != DeserializationError::Ok) continue;
-
-        const char* type = chunk["type"] | "";
-
-        if (strcmp(type, "content_block_start") == 0) {
-            JsonObject block = chunk["content_block"];
-            const char* btype = block["type"] | "";
-            if (strcmp(btype, "tool_use") == 0 && resp->call_count < M5CLAW_MAX_TOOL_CALLS) {
-                current_tool_idx = resp->call_count;
-                LlmToolCall& call = resp->calls[resp->call_count];
-                memset(&call, 0, sizeof(call));
-                strlcpy(call.id, block["id"] | "", sizeof(call.id));
-                strlcpy(call.name, block["name"] | "", sizeof(call.name));
-                resp->call_count++;
-            }
-        }
-        else if (strcmp(type, "content_block_delta") == 0) {
-            JsonObject delta = chunk["delta"];
-            const char* dtype = delta["type"] | "";
-
-            if (strcmp(dtype, "text_delta") == 0) {
-                const char* text = delta["text"] | "";
-                size_t tlen = strlen(text);
-                if (tlen > 0) {
-                    text_append(resp, text, tlen);
-                    if (on_token) on_token(text);
-                    got_response = true;
-                }
-            }
-            else if (strcmp(dtype, "input_json_delta") == 0) {
-                const char* partial = delta["partial_json"] | "";
-                if (current_tool_idx >= 0 && current_tool_idx < M5CLAW_MAX_TOOL_CALLS)
-                    tool_inputs[current_tool_idx] += partial;
-            }
-        }
-        else if (strcmp(type, "content_block_stop") == 0) {
-            if (current_tool_idx >= 0 && current_tool_idx < resp->call_count) {
-                String& inp = tool_inputs[current_tool_idx];
-                if (inp.length() > 0) {
-                    resp->calls[current_tool_idx].input = strdup(inp.c_str());
-                    resp->calls[current_tool_idx].input_len = inp.length();
-                    inp = "";
-                }
-            }
-            current_tool_idx = -1;
-        }
-        else if (strcmp(type, "message_delta") == 0) {
-            const char* stop = chunk["delta"]["stop_reason"] | "";
-            resp->tool_use = (strcmp(stop, "tool_use") == 0);
-            got_response = true;
-        }
-        else if (strcmp(type, "message_stop") == 0) {
-            got_response = true;
-            break;
-        }
-        else if (strcmp(type, "error") == 0) {
-            const char* msg = chunk["error"]["message"] | "unknown error";
-            Serial.printf("[LLM] Stream error: %s\n", msg);
-            break;
-        }
-    }
-
-    if (resp->tool_use || resp->call_count > 0)
-        build_raw_content_json(resp);
-
-    heap_caps_free(line);
-    return got_response;
-}
-
-// ── OpenAI SSE stream processor ───────────────────────────────
 
 static bool process_openai_stream(ChunkedReader& reader, LlmResponse* resp,
-                                   LlmStreamCallback on_token) {
+                                  LlmStreamCallback on_token) {
     char* line = (char*)alloc_prefer_psram(M5CLAW_SSE_LINE_BUF);
     if (!line) return false;
 
@@ -409,7 +518,6 @@ static bool process_openai_stream(ChunkedReader& reader, LlmResponse* resp,
 
     while (!is_aborted()) {
         if (!read_sse_line(reader, line, M5CLAW_SSE_LINE_BUF)) break;
-
         if (strncmp(line, "data: ", 6) != 0) continue;
         const char* data = line + 6;
 
@@ -422,6 +530,7 @@ static bool process_openai_stream(ChunkedReader& reader, LlmResponse* resp,
         if (deserializeJson(chunk, data) != DeserializationError::Ok) continue;
 
         JsonObject choice = chunk["choices"][0];
+        if (choice.isNull()) continue;
         JsonObject delta = choice["delta"];
 
         const char* content = delta["content"] | (const char*)nullptr;
@@ -439,20 +548,14 @@ static bool process_openai_stream(ChunkedReader& reader, LlmResponse* resp,
             for (JsonVariant tc : tool_calls) {
                 int idx = tc["index"] | 0;
                 if (idx >= M5CLAW_MAX_TOOL_CALLS) continue;
-
+                if (idx >= resp->call_count) resp->call_count = idx + 1;
+                LlmToolCall& call = resp->calls[idx];
                 const char* tc_id = tc["id"] | (const char*)nullptr;
                 const char* fn_name = tc["function"]["name"] | (const char*)nullptr;
-                if (tc_id && resp->call_count <= idx) {
-                    LlmToolCall& call = resp->calls[idx];
-                    memset(&call, 0, sizeof(call));
-                    strlcpy(call.id, tc_id, sizeof(call.id));
-                    if (fn_name) strlcpy(call.name, fn_name, sizeof(call.name));
-                    if (idx >= resp->call_count) resp->call_count = idx + 1;
-                }
-
+                if (tc_id) strlcpy(call.id, tc_id, sizeof(call.id));
+                if (fn_name) strlcpy(call.name, fn_name, sizeof(call.name));
                 const char* args = tc["function"]["arguments"] | (const char*)nullptr;
-                if (args && idx < M5CLAW_MAX_TOOL_CALLS)
-                    tool_inputs[idx] += args;
+                if (args) tool_inputs[idx] += args;
             }
         }
 
@@ -469,16 +572,76 @@ static bool process_openai_stream(ChunkedReader& reader, LlmResponse* resp,
             resp->calls[i].input_len = tool_inputs[i].length();
         }
     }
-    if (resp->call_count > 0) resp->tool_use = true;
-
-    if (resp->tool_use)
-        build_raw_content_json(resp);
+    if (resp->call_count > 0) {
+        resp->tool_use = true;
+        build_tool_response_json(resp);
+    }
 
     heap_caps_free(line);
     return got_response;
 }
 
-// ── Main LLM function (SSE streaming) ─────────────────────────
+static bool read_json_body(WiFiClientSecure& client, bool chunked, char** outBuf, size_t* outLen, size_t maxLen) {
+    *outBuf = nullptr;
+    *outLen = 0;
+    char* buf = (char*)alloc_prefer_psram(maxLen + 1);
+    if (!buf) return false;
+
+    size_t len = 0;
+    ChunkedReader reader(client, chunked);
+    while (len < maxLen) {
+        int c = reader.readByte();
+        if (c < 0) break;
+        buf[len++] = (char)c;
+    }
+    buf[len] = '\0';
+    *outBuf = buf;
+    *outLen = len;
+    return len > 0;
+}
+
+static bool parse_openai_json_response(const char* body, size_t bodyLen, LlmResponse* resp) {
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, body, bodyLen);
+    if (err) return false;
+
+    JsonObject choice = doc["choices"][0];
+    if (choice.isNull()) return false;
+
+    JsonObject message = choice["message"];
+    const char* content = message["content"] | (const char*)nullptr;
+    if (content && content[0]) {
+        if (!text_append(resp, content, strlen(content))) return false;
+    }
+
+    JsonArray toolCalls = message["tool_calls"];
+    if (!toolCalls.isNull()) {
+        int idx = 0;
+        for (JsonVariant tc : toolCalls) {
+            if (idx >= M5CLAW_MAX_TOOL_CALLS) break;
+            LlmToolCall& call = resp->calls[idx];
+            const char* tcId = tc["id"] | "";
+            const char* fnName = tc["function"]["name"] | "";
+            const char* args = tc["function"]["arguments"] | "{}";
+            strlcpy(call.id, tcId, sizeof(call.id));
+            strlcpy(call.name, fnName, sizeof(call.name));
+            call.input = strdup(args);
+            call.input_len = strlen(args);
+            idx++;
+        }
+        resp->call_count = idx;
+        if (resp->call_count > 0) {
+            resp->tool_use = true;
+            build_tool_response_json(resp);
+        }
+    }
+
+    const char* finish = choice["finish_reason"] | "";
+    if (strcmp(finish, "tool_calls") == 0) {
+        resp->tool_use = true;
+    }
+    return resp->text_len > 0 || resp->call_count > 0;
+}
 
 bool llm_chat_tools(const char* system_prompt,
                     JsonDocument& messages,
@@ -495,19 +658,19 @@ bool llm_chat_tools(const char* system_prompt,
     JsonDocument* bodyDoc = bodyDocMem ? new (bodyDocMem) JsonDocument : nullptr;
     if (!bodyDoc) return false;
 
-    if (provider_is_openai()) {
-        build_openai_body(*bodyDoc, system_prompt, messages, tools_json);
-    } else {
-        build_anthropic_body(*bodyDoc, system_prompt, messages, tools_json);
-    }
+    build_openai_body(*bodyDoc, system_prompt, messages, tools_json);
 
     String bodyStr;
-    bodyStr.reserve(4096);
+    bodyStr.reserve(8192);
     serializeJson(*bodyDoc, bodyStr);
     bodyDoc->~JsonDocument();
     heap_caps_free(bodyDoc);
 
     Serial.printf("[LLM] Request %d bytes to %s%s\n", bodyStr.length(), llm_host(), llm_path());
+
+    if (s_pre_read_free_fn) {
+        s_pre_read_free_fn();
+    }
 
     WiFiClientSecure client;
     if (!secure_connect(client, llm_host(), 443, "[LLM]")) {
@@ -519,52 +682,151 @@ bool llm_chat_tools(const char* system_prompt,
     client.printf("Host: %s\r\n", llm_host());
     client.println("Content-Type: application/json");
     client.println("Accept: text/event-stream");
-    if (provider_is_openai()) {
-        client.printf("Authorization: Bearer %s\r\n", s_api_key);
-    } else {
-        client.printf("x-api-key: %s\r\n", s_api_key);
-        client.printf("anthropic-version: %s\r\n", M5CLAW_LLM_API_VERSION);
+    client.printf("Authorization: Bearer %s\r\n", s_api_key);
+    size_t contentLen = 0;
+    size_t sentLen = 0;
+    if (!send_request_body(client, bodyStr, &contentLen, &sentLen)) {
+        client.stop();
+        return false;
     }
-    client.printf("Content-Length: %d\r\n", bodyStr.length());
-    client.println("Connection: close");
-    client.println();
-    client.print(bodyStr);
-    bodyStr = "";
-
-    if (s_pre_read_free_fn) {
-        s_pre_read_free_fn();
-    }
+    Serial.printf("[LLM] Sent %u/%u bytes\n", (unsigned)sentLen, (unsigned)contentLen);
+    bodyStr = String();
 
     if (is_aborted()) {
-        Serial.println("[LLM] Aborted before reading response");
         client.stop();
         return false;
     }
 
-    bool chunked = false;
-    if (!skip_http_headers(client, &chunked)) {
-        Serial.println("[LLM] Disconnected or aborted waiting for response");
+    HttpResponseMeta meta = {};
+    if (!read_http_headers(client, &meta)) {
+        client.stop();
+        return false;
+    }
+    Serial.printf("[LLM] Response status=%d type=%s chunked=%d\n",
+                  meta.status_code, meta.content_type[0] ? meta.content_type : "(unknown)", meta.chunked);
+
+    if (meta.status_code < 200 || meta.status_code >= 300) {
+        char* errBody = nullptr;
+        size_t errLen = 0;
+        if (read_json_body(client, meta.chunked, &errBody, &errLen, kErrorBodyPreviewMax) && errBody) {
+            Serial.printf("[LLM] Error body: %.400s\n", errBody);
+            heap_caps_free(errBody);
+        }
         client.stop();
         return false;
     }
 
-    Serial.printf("[LLM] Streaming response (chunked=%d, heap=%d)\n", chunked, ESP.getFreeHeap());
-
-    ChunkedReader reader(client, chunked);
-    bool ok;
-    if (provider_is_openai()) {
-        ok = process_openai_stream(reader, resp, on_token);
-    } else {
-        ok = process_anthropic_stream(reader, resp, on_token);
+    if (str_contains_nocase(meta.content_type, "application/json")) {
+        char* jsonBody = nullptr;
+        size_t jsonLen = 0;
+        bool ok = read_json_body(client, meta.chunked, &jsonBody, &jsonLen, 256 * 1024);
+        client.stop();
+        if (!ok || !jsonBody) return false;
+        bool parsed = parse_openai_json_response(jsonBody, jsonLen, resp);
+        if (!parsed) {
+            Serial.printf("[LLM] JSON response parse failed: %.400s\n", jsonBody);
+        }
+        heap_caps_free(jsonBody);
+        Serial.printf("[LLM] %d text bytes, %d tool calls, tool_use=%d\n",
+                      (int)resp->text_len, resp->call_count, resp->tool_use);
+        return parsed;
     }
 
+    ChunkedReader reader(client, meta.chunked);
+    bool ok = process_openai_stream(reader, resp, on_token);
     client.stop();
 
     if (!ok && (!resp->text || resp->text_len == 0) && resp->call_count == 0) {
         Serial.println("[LLM] Empty/failed stream response");
     }
-
     Serial.printf("[LLM] %d text bytes, %d tool calls, tool_use=%d\n",
                   (int)resp->text_len, resp->call_count, resp->tool_use);
     return ok;
+}
+
+bool llm_speak_text(const char* text) {
+    if (!text || !text[0] || s_api_key[0] == '\0' || WiFi.status() != WL_CONNECTED) return false;
+
+    String clipped = text;
+    if (clipped.length() > M5CLAW_TTS_TEXT_MAX) {
+        clipped = clipped.substring(0, M5CLAW_TTS_TEXT_MAX);
+    }
+
+    JsonDocument doc;
+    doc["model"] = M5CLAW_MIMO_TTS_MODEL;
+    JsonArray msgs = doc["messages"].to<JsonArray>();
+    JsonObject msg = msgs.add<JsonObject>();
+    msg["role"] = "assistant";
+    msg["content"] = clipped;
+    JsonObject audio = doc["audio"].to<JsonObject>();
+    audio["format"] = "pcm16";
+    audio["voice"] = M5CLAW_MIMO_TTS_VOICE;
+    doc["stream"] = false;
+
+    String bodyStr;
+    bodyStr.reserve(1024);
+    serializeJson(doc, bodyStr);
+
+    WiFiClientSecure client;
+    if (!secure_connect(client, llm_host(), 443, "[TTS]")) return false;
+
+    client.printf("POST %s HTTP/1.1\r\n", llm_path());
+    client.printf("Host: %s\r\n", llm_host());
+    client.println("Content-Type: application/json");
+    client.println("Accept: application/json");
+    client.printf("Authorization: Bearer %s\r\n", s_api_key);
+    client.printf("Content-Length: %d\r\n", bodyStr.length());
+    client.println("Connection: close");
+    client.println();
+    client.print(bodyStr);
+
+    HttpResponseMeta meta = {};
+    if (!read_http_headers(client, &meta)) {
+        client.stop();
+        return false;
+    }
+    if (meta.status_code < 200 || meta.status_code >= 300) {
+        client.stop();
+        return false;
+    }
+
+    char* body = nullptr;
+    size_t bodyLen = 0;
+    bool ok = read_json_body(client, meta.chunked, &body, &bodyLen, 256 * 1024);
+    client.stop();
+    if (!ok || !body) return false;
+
+    JsonDocument respDoc;
+    DeserializationError err = deserializeJson(respDoc, body, bodyLen);
+    if (err) {
+        heap_caps_free(body);
+        return false;
+    }
+    heap_caps_free(body);
+
+    const char* audioB64 = respDoc["choices"][0]["message"]["audio"]["data"] | "";
+    if (!audioB64[0]) return false;
+
+    size_t maxDecoded = (strlen(audioB64) * 3) / 4 + 4;
+    uint8_t* decoded = (uint8_t*)alloc_prefer_psram(maxDecoded);
+    if (!decoded) return false;
+
+    size_t decodedLen = 0;
+    if (mbedtls_base64_decode(decoded, maxDecoded, &decodedLen,
+                              (const unsigned char*)audioB64, strlen(audioB64)) != 0) {
+        heap_caps_free(decoded);
+        return false;
+    }
+
+    M5Cardputer.Speaker.stop();
+    bool played = M5Cardputer.Speaker.playRaw((const int16_t*)decoded, decodedLen / 2,
+                                              M5CLAW_MIMO_TTS_SAMPLE_RATE, false, 1, -1, true);
+    if (played) {
+        unsigned long waitUntil = millis() + (decodedLen * 1000UL / 2 / M5CLAW_MIMO_TTS_SAMPLE_RATE) + 1500;
+        while (M5Cardputer.Speaker.isPlaying() && millis() < waitUntil) {
+            delay(10);
+        }
+    }
+    heap_caps_free(decoded);
+    return played;
 }

@@ -1,38 +1,57 @@
 Import("env")
-import configparser, os
+import configparser
+import json
+import os
 
+project_dir = env.subst("$PROJECT_DIR")
 config_file = os.path.join(env.subst("$PROJECT_DIR"), "user_config.ini")
+bootstrap_file = os.path.join(project_dir, "data", "config", "BOOTSTRAP.json")
+
+mapping = {
+    "wifi_ssid": "wifi_ssid",
+    "wifi_pass": "wifi_pass",
+    "mimo_api_key": "mimo_api_key",
+    "mimo_model": "mimo_model",
+    "city": "city",
+    "wechat_token": "wechat_token",
+    "wechat_api_host": "wechat_api_host",
+}
+
 if not os.path.exists(config_file):
-    print("[M5Claw] No user_config.ini found, using defaults")
+    if os.path.exists(bootstrap_file):
+        os.remove(bootstrap_file)
+        print("[M5Claw] Removed stale bootstrap config")
+    print("[M5Claw] No user_config.ini found, skipping bootstrap config")
 else:
     print(f"[M5Claw] Loading config from {config_file}")
     cp = configparser.ConfigParser()
     cp.read(config_file, encoding="utf-8")
 
-    mapping = {
-        "wifi_ssid":        "USER_WIFI_SSID",
-        "wifi_pass":        "USER_WIFI_PASS",
-        "llm_api_key":      "USER_LLM_KEY",
-        "llm_provider":     "USER_LLM_PROVIDER",
-        "llm_model":        "USER_LLM_MODEL",
-        "llm_host":         "USER_LLM_HOST",
-        "llm_path":         "USER_LLM_PATH",
-        "dashscope_key":    "USER_DS_KEY",
-        "city":             "USER_CITY",
-        "wechat_token":     "USER_WECHAT_TOKEN",
-        "wechat_api_host":  "USER_WECHAT_API_HOST",
-        "glm_search_key":   "USER_GLM_SEARCH_KEY",
-    }
-
-    flags = []
-    for ini_key, macro_name in mapping.items():
+    payload = {}
+    for ini_key, json_key in mapping.items():
         val = cp.get("user", ini_key, fallback="").strip()
         if val:
-            escaped = val.replace("\\", "\\\\").replace('"', '\\"')
-            flags.append(f'-D{macro_name}=\\"{escaped}\\"')
-            display = val[:8] + "..." if len(val) > 12 else val
-            print(f"  {ini_key} = {display}")
+            payload[json_key] = val
+            print(f"  prepared {ini_key}")
 
-    if flags:
-        env.Append(BUILD_FLAGS=flags)
-        print(f"[M5Claw] Injected {len(flags)} config values")
+    if "mimo_api_key" not in payload:
+        legacy_key = cp.get("user", "llm_api_key", fallback="").strip()
+        if legacy_key:
+            payload["mimo_api_key"] = legacy_key
+            print("  prepared llm_api_key -> mimo_api_key")
+
+    if "mimo_model" not in payload:
+        legacy_model = cp.get("user", "llm_model", fallback="").strip()
+        if legacy_model:
+            payload["mimo_model"] = legacy_model
+            print("  prepared llm_model -> mimo_model")
+
+    if payload:
+        os.makedirs(os.path.dirname(bootstrap_file), exist_ok=True)
+        with open(bootstrap_file, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        print(f"[M5Claw] Wrote bootstrap config with {len(payload)} values")
+    elif os.path.exists(bootstrap_file):
+        os.remove(bootstrap_file)
+        print("[M5Claw] Removed empty bootstrap config")

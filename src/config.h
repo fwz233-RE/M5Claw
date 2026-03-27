@@ -5,6 +5,8 @@ namespace Config {
     bool load();
     void save();
     void reset();
+    bool importBootstrapFile();
+    void applyDefaults();
 
     const String& getSSID();
     const String& getPassword();
@@ -15,15 +17,6 @@ namespace Config {
     // LLM config
     const String& getLlmApiKey();
     const String& getLlmModel();
-    const String& getLlmProvider();
-    const String& getLlmHost();
-    const String& getLlmPath();
-
-    // DashScope config (STT + TTS)
-    const String& getDashScopeKey();
-
-    // Search
-    const String& getGlmSearchKey();
 
     // WeChat
     const String& getWechatToken();
@@ -36,11 +29,6 @@ namespace Config {
     void setCity(const String& city);
     void setLlmApiKey(const String& key);
     void setLlmModel(const String& model);
-    void setLlmProvider(const String& provider);
-    void setLlmHost(const String& host);
-    void setLlmPath(const String& path);
-    void setDashScopeKey(const String& key);
-    void setGlmSearchKey(const String& key);
     void setWechatToken(const String& token);
     void setWechatApiHost(const String& host);
 

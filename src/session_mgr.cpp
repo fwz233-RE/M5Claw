@@ -58,12 +58,13 @@ String SessionMgr::getHistoryJson(const char* chat_id, int maxMessages) {
     JsonDocument doc;
     JsonArray arr = doc.to<JsonArray>();
 
-    int start = (count > maxMessages) ? count - maxMessages : 0;
     int total = (count > M5CLAW_SESSION_MAX_MSGS) ? M5CLAW_SESSION_MAX_MSGS : count;
     int ringStart = (count > M5CLAW_SESSION_MAX_MSGS) ? (count % M5CLAW_SESSION_MAX_MSGS) : 0;
+    int window = (total > maxMessages) ? maxMessages : total;
+    int skip = total - window;
 
-    for (int i = 0; i < total && i < maxMessages; i++) {
-        int idx = (ringStart + i) % M5CLAW_SESSION_MAX_MSGS;
+    for (int i = 0; i < window; i++) {
+        int idx = (ringStart + skip + i) % M5CLAW_SESSION_MAX_MSGS;
         if (lines[idx].length() == 0) continue;
         JsonDocument lineDoc;
         if (deserializeJson(lineDoc, lines[idx]) == DeserializationError::Ok) {
@@ -75,4 +76,3 @@ String SessionMgr::getHistoryJson(const char* chat_id, int maxMessages) {
     serializeJson(doc, result);
     return result;
 }
-
