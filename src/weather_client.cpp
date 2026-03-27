@@ -7,6 +7,31 @@
 // Timeout for HTTP read operations (10 seconds)
 static constexpr unsigned long HTTP_TIMEOUT_MS = 10000;
 
+static bool urlEncodeQuery(const String& input, char* out, size_t outSize) {
+    if (!out || outSize == 0) return false;
+    size_t pos = 0;
+    for (size_t i = 0; i < input.length(); ++i) {
+        uint8_t c = (uint8_t)input[i];
+        bool unreserved =
+            (c >= 'A' && c <= 'Z') ||
+            (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == '~';
+        if (unreserved) {
+            if (pos + 1 >= outSize) return false;
+            out[pos++] = (char)c;
+        } else {
+            if (pos + 3 >= outSize) return false;
+            static const char hex[] = "0123456789ABCDEF";
+            out[pos++] = '%';
+            out[pos++] = hex[(c >> 4) & 0x0F];
+            out[pos++] = hex[c & 0x0F];
+        }
+    }
+    out[pos] = '\0';
+    return true;
+}
+
 // Skip HTTP response headers (zero heap allocation).
 // Detects \r\n\r\n (standard) or \n\n (lenient) as end-of-headers.
 // Also scans for "Transfer-Encoding: chunked" and sets *chunked flag.
@@ -135,10 +160,17 @@ bool WeatherClient::resolveCity(const String& city) {
         return false;
     }
 
-    char path[160];
-    int written = snprintf(path, sizeof(path), "/v1/search?name=%s&count=1&language=en", city.c_str());
-    if (written >= (int)sizeof(path)) {
+    char cityEncoded[128];
+    if (!urlEncodeQuery(city, cityEncoded, sizeof(cityEncoded))) {
         Serial.println("[WEATHER] City name too long");
+        client.stop();
+        return false;
+    }
+
+    char path[192];
+    int written = snprintf(path, sizeof(path), "/v1/search?name=%s&count=1&language=en", cityEncoded);
+    if (written < 0 || written >= (int)sizeof(path)) {
+        Serial.println("[WEATHER] City query too long");
         client.stop();
         return false;
     }

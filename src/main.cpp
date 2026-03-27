@@ -77,7 +77,7 @@ String stopVoiceRecording();
 void streamVoiceData();
 void processSerialCommands();
 void dispatchOutbound();
-void fillBuildTimeDefaults();
+bool fillBuildTimeDefaults();
 
 static void onAgentResponse(const char* text);
 static void onAgentToken(const char* token);
@@ -93,21 +93,30 @@ static bool hasPreconfiguredOnlineSettings() {
         && Config::getLlmModel().length() > 0;
 }
 
-static void setIfEmpty(void (*setter)(const String&), const String& current, const char* buildVal) {
-    if (current.length() == 0 && buildVal && buildVal[0]) {
-        setter(String(buildVal));
+bool fillBuildTimeDefaults() {
+    bool changed = false;
+
+    if (Config::getSSID().length() == 0 && USER_WIFI_SSID[0]) {
+        Config::setSSID(String(USER_WIFI_SSID));
+        changed = true;
     }
-}
+    if (Config::getPassword().length() == 0 && USER_WIFI_PASS[0]) {
+        Config::setPassword(String(USER_WIFI_PASS));
+        changed = true;
+    }
+    if (Config::getLlmModel().length() == 0 && USER_MIMO_MODEL[0]) {
+        Config::setLlmModel(String(USER_MIMO_MODEL));
+        changed = true;
+    }
+    if (Config::getCity().length() == 0 && USER_CITY[0]) {
+        Config::setCity(String(USER_CITY));
+        changed = true;
+    }
 
-void fillBuildTimeDefaults() {
-    setIfEmpty(Config::setSSID,           Config::getSSID(),           USER_WIFI_SSID);
-    setIfEmpty(Config::setPassword,       Config::getPassword(),       USER_WIFI_PASS);
-    setIfEmpty(Config::setLlmModel,       Config::getLlmModel(),       USER_MIMO_MODEL);
-    setIfEmpty(Config::setCity,           Config::getCity(),           USER_CITY);
-
-    if (USER_MIMO_KEY[0]) {
+    if (Config::getLlmApiKey().length() == 0 && USER_MIMO_KEY[0]) {
         Config::setTransientLlmApiKey(String(USER_MIMO_KEY));
     }
+    return changed;
 }
 
 static bool isSensitiveNvsKey(const char* key) {
@@ -295,9 +304,11 @@ void setup() {
     Config::load();
     MemoryStore::init();
     Config::importBootstrapFile();
-    Config::applyDefaults();
-    fillBuildTimeDefaults();
-    Config::save();
+    bool configChanged = Config::applyDefaults();
+    configChanged |= fillBuildTimeDefaults();
+    if (configChanged) {
+        Config::save();
+    }
     Serial.println("[BOOT] Config loaded");
     Serial.println("[BOOT] Type 'help' in serial monitor for config commands");
     Serial.println("[BOOT] SPIFFS OK");

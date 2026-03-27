@@ -475,8 +475,16 @@ void WechatBot::start() {
     }
     if (s_task) return;
 
-    xTaskCreatePinnedToCore(wechatTask, "wechat", M5CLAW_WECHAT_TASK_STACK,
-                            nullptr, M5CLAW_WECHAT_TASK_PRIO, &s_task, M5CLAW_WECHAT_TASK_CORE);
+    s_stopRequested = false;
+    s_stopped = false;
+    BaseType_t ok = xTaskCreatePinnedToCore(wechatTask, "wechat", M5CLAW_WECHAT_TASK_STACK,
+                                            nullptr, M5CLAW_WECHAT_TASK_PRIO, &s_task, M5CLAW_WECHAT_TASK_CORE);
+    if (ok != pdPASS || !s_task) {
+        s_task = nullptr;
+        s_running = false;
+        Serial.println("[WECHAT] Failed to start task");
+        return;
+    }
     s_running = true;
     Serial.println("[WECHAT] Started");
 }
@@ -511,11 +519,13 @@ void WechatBot::resume() {
 }
 
 bool WechatBot::sendMessage(const char* userId, const char* text) {
-    if (!s_token[0] || !s_api_host[0]) return false;
+    if (!s_token[0] || !s_api_host[0] || !userId || !userId[0] || !text) return false;
 
     size_t textLen = strlen(text);
     size_t offset = 0;
     bool allOk = true;
+
+    if (textLen == 0) return true;
 
     while (offset < textLen) {
         size_t chunk = textLen - offset;
@@ -562,7 +572,7 @@ bool WechatBot::sendMessage(const char* userId, const char* text) {
 }
 
 bool WechatBot::sendTyping(const char* userId, int status) {
-    if (!s_token[0] || !s_api_host[0]) return false;
+    if (!s_token[0] || !s_api_host[0] || !userId || !userId[0]) return false;
 
     JsonDocument doc;
     doc["ilink_user_id"] = userId;

@@ -159,7 +159,10 @@ static bool buildInitialMessages(const char* sessionId, const AgentRequest& req,
     void* messagesMem = alloc_prefer_psram(sizeof(JsonDocument));
     JsonDocument* messages = messagesMem ? new (messagesMem) JsonDocument : nullptr;
     if (!messages) return false;
-    deserializeJson(*messages, histJson);
+    if (deserializeJson(*messages, histJson) != DeserializationError::Ok || !messages->is<JsonArray>()) {
+        messages->clear();
+        messages->to<JsonArray>();
+    }
     histJson = "";
     if (!appendRequestUserMessage(*messages, req)) {
         messages->~JsonDocument();

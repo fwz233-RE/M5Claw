@@ -176,9 +176,17 @@ bool Config::importBootstrapFile() {
     return true;
 }
 
-void Config::applyDefaults() {
-    if (llmModel.length() == 0) llmModel = M5CLAW_LLM_DEFAULT_MODEL;
-    if (city.length() == 0) city = "Beijing";
+bool Config::applyDefaults() {
+    bool changed = false;
+    if (llmModel.length() == 0) {
+        llmModel = M5CLAW_LLM_DEFAULT_MODEL;
+        changed = true;
+    }
+    if (city.length() == 0) {
+        city = "Beijing";
+        changed = true;
+    }
+    return changed;
 }
 
 const String& Config::getSSID()            { return ssid; }

@@ -4,11 +4,11 @@
 #include <ArduinoJson.h>
 
 static String sessionPath(const char* chat_id) {
-    const char* id = chat_id;
+    const char* id = (chat_id && chat_id[0]) ? chat_id : "local";
     char hashed[16];
-    if (strlen(chat_id) > 16) {
+    if (strlen(id) > 16) {
         uint32_t h = 5381;
-        for (const char* p = chat_id; *p; p++) h = h * 33 + (unsigned char)*p;
+        for (const char* p = id; *p; p++) h = h * 33 + (unsigned char)*p;
         snprintf(hashed, sizeof(hashed), "h%08x", h);
         id = hashed;
     }
@@ -28,8 +28,8 @@ bool SessionMgr::appendMessage(const char* chat_id, const char* role, const char
     if (!f) return false;
 
     JsonDocument doc;
-    doc["role"] = role;
-    doc["content"] = content;
+    doc["role"] = role ? role : "";
+    doc["content"] = content ? content : "";
     String line;
     serializeJson(doc, line);
     f.println(line);
@@ -38,6 +38,8 @@ bool SessionMgr::appendMessage(const char* chat_id, const char* role, const char
 }
 
 String SessionMgr::getHistoryJson(const char* chat_id, int maxMessages) {
+    if (maxMessages <= 0) return "[]";
+
     String path = sessionPath(chat_id);
     File f = SPIFFS.open(path, "r");
     if (!f) return "[]";

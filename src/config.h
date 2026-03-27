@@ -6,7 +6,7 @@ namespace Config {
     void save();
     void reset();
     bool importBootstrapFile();
-    void applyDefaults();
+    bool applyDefaults();
 
     const String& getSSID();
     const String& getPassword();

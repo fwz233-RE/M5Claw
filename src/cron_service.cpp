@@ -10,6 +10,28 @@ static CronJob s_jobs[M5CLAW_CRON_MAX_JOBS];
 static int s_jobCount = 0;
 static TimerHandle_t s_timer = nullptr;
 
+static int compactJobs() {
+    int active = 0;
+    for (int i = 0; i < s_jobCount; i++) {
+        if (!s_jobs[i].enabled) continue;
+        if (active != i) s_jobs[active] = s_jobs[i];
+        active++;
+    }
+    for (int i = active; i < s_jobCount; i++) {
+        memset(&s_jobs[i], 0, sizeof(s_jobs[i]));
+    }
+    s_jobCount = active;
+    return s_jobCount;
+}
+
+static int countEnabledJobs() {
+    int count = 0;
+    for (int i = 0; i < s_jobCount; i++) {
+        if (s_jobs[i].enabled) count++;
+    }
+    return count;
+}
+
 static void generateId(char* buf) {
     uint32_t r = esp_random();
     snprintf(buf, 9, "%08x", r);
@@ -135,15 +157,7 @@ void CronService::start() {
 }
 
 bool CronService::addJob(CronJob* job) {
-    // compact disabled jobs
-    int active = 0;
-    for (int i = 0; i < s_jobCount; i++) {
-        if (s_jobs[i].enabled) {
-            if (active != i) s_jobs[active] = s_jobs[i];
-            active++;
-        }
-    }
-    s_jobCount = active;
+    compactJobs();
 
     if (s_jobCount >= M5CLAW_CRON_MAX_JOBS) return false;
 
@@ -162,6 +176,7 @@ bool CronService::removeJob(const char* jobId) {
     for (int i = 0; i < s_jobCount; i++) {
         if (strcmp(s_jobs[i].id, jobId) == 0) {
             s_jobs[i].enabled = false;
+            compactJobs();
             saveJobs();
             return true;
         }
@@ -175,5 +190,5 @@ void CronService::listJobs(const CronJob** jobs, int* count) {
 }
 
 int CronService::getJobCount() {
-    return s_jobCount;
+    return countEnabledJobs();
 }
