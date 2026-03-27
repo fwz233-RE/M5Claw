@@ -102,6 +102,12 @@ static bool applyBootstrapValue(const JsonVariantConst& value, String& target) {
     return true;
 }
 
+static bool applyBootstrapSecretValue(const JsonVariantConst& value, String& target, bool* transientFlag) {
+    if (!applyBootstrapValue(value, target)) return false;
+    if (transientFlag) *transientFlag = false;
+    return true;
+}
+
 bool Config::load() {
     prefs.begin("m5claw", true);
     ssid            = prefs.getString("ssid", "");
@@ -158,8 +164,8 @@ bool Config::importBootstrapFile() {
     int changed = 0;
     changed += applyBootstrapValue(doc["wifi_ssid"], ssid) ? 1 : 0;
     changed += applyBootstrapValue(doc["wifi_pass"], password) ? 1 : 0;
-    changed += applyBootstrapValue(doc["mimo_api_key"], llmApiKey) ? 1 : 0;
-    changed += applyBootstrapValue(doc["llm_api_key"], llmApiKey) ? 1 : 0;
+    changed += applyBootstrapSecretValue(doc["mimo_api_key"], llmApiKey, &llmApiKeyTransient) ? 1 : 0;
+    changed += applyBootstrapSecretValue(doc["llm_api_key"], llmApiKey, &llmApiKeyTransient) ? 1 : 0;
     changed += applyBootstrapValue(doc["mimo_model"], llmModel) ? 1 : 0;
     changed += applyBootstrapValue(doc["llm_model"], llmModel) ? 1 : 0;
     changed += applyBootstrapValue(doc["city"], city) ? 1 : 0;

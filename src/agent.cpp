@@ -63,9 +63,16 @@ static void preSwapToSPIFFS() {
     if (s_freeable_messages && *s_freeable_messages) {
         JsonDocument* doc = *s_freeable_messages;
         File f = SPIFFS.open(M5CLAW_AGENT_SWAP_FILE, "w");
+        bool swapped = false;
         if (f) {
-            serializeJson(*doc, f);
+            size_t written = serializeJson(*doc, f);
             f.close();
+            swapped = written > 0;
+        }
+        if (!swapped) {
+            Serial.println("[AGENT] Failed to swap messages to SPIFFS");
+            SPIFFS.remove(M5CLAW_AGENT_SWAP_FILE);
+            return;
         }
         doc->~JsonDocument();
         heap_caps_free(doc);
@@ -340,7 +347,9 @@ static void processRequest(AgentRequest& req, char* system_prompt, char* tool_ou
         Serial.println("[AGENT] Request was aborted");
     }
 
-    const char* responseText = (final_text && final_text[0]) ? final_text : "请求失败，请重试。";
+    const char* responseText = (final_text && final_text[0])
+        ? final_text
+        : "Request failed, please try again.";
 
     if (!wasAborted && final_text && final_text[0]) {
         SessionMgr::appendMessage(sessionId, "user", reqSummary.c_str());

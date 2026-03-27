@@ -1,6 +1,6 @@
-# M5ClawPro
+# M5Claw
 
-M5ClawPro 是一个运行在 M5Stack Cardputer 上的 AI 助手固件，围绕 `ESP32-S3 + SPIFFS + PlatformIO + Xiaomi MiMo` 构建，提供本地陪伴界面、键盘聊天、语音输入、语音播报、微信互联、天气显示、定时任务、记忆文件和技能扩展能力。
+M5Claw 是一个运行在 M5Stack Cardputer 上的 AI 助手固件，围绕 `ESP32-S3 + SPIFFS + PlatformIO + Xiaomi MiMo` 构建，提供本地陪伴界面、键盘聊天、语音输入、语音播报、微信互联、天气显示、定时任务、记忆文件和技能扩展能力。
 
 项目面向“可直接刷进设备并长期运行”的形态，而不是单次 Demo。仓库内已经包含固件代码、SPIFFS 数据和一键刷机脚本。
 
