@@ -744,79 +744,53 @@ bool llm_chat_tools(const char* system_prompt,
     return ok;
 }
 
-bool llm_speak_text(const char* text) {
-    if (!text || !text[0] || s_api_key[0] == '\0' || WiFi.status() != WL_CONNECTED) return false;
-
-    String clipped = text;
-    if (clipped.length() > M5CLAW_TTS_TEXT_MAX) {
-        clipped = clipped.substring(0, M5CLAW_TTS_TEXT_MAX);
-    }
-
-    JsonDocument doc;
-    doc["model"] = M5CLAW_MIMO_TTS_MODEL;
-    JsonArray msgs = doc["messages"].to<JsonArray>();
-    JsonObject msg = msgs.add<JsonObject>();
-    msg["role"] = "assistant";
-    msg["content"] = clipped;
-    JsonObject audio = doc["audio"].to<JsonObject>();
-    audio["format"] = "pcm16";
-    audio["voice"] = M5CLAW_MIMO_TTS_VOICE;
-    doc["stream"] = false;
-
-    String bodyStr;
-    bodyStr.reserve(1024);
-    serializeJson(doc, bodyStr);
+static bool tts_post_json(const char* path, const String& bodyStr,
+                          HttpResponseMeta* meta, char** body, size_t* bodyLen) {
+    *body = nullptr;
+    *bodyLen = 0;
 
     WiFiClientSecure client;
     if (!secure_connect(client, llm_host(), 443, "[TTS]")) return false;
 
-    client.printf("POST %s HTTP/1.1\r\n", llm_path());
+    client.printf("POST %s HTTP/1.1\r\n", path);
     client.printf("Host: %s\r\n", llm_host());
     client.println("Content-Type: application/json");
-    client.println("Accept: application/json");
+    client.println("Accept: application/json, audio/*, application/octet-stream");
     client.printf("Authorization: Bearer %s\r\n", s_api_key);
     client.printf("Content-Length: %d\r\n", bodyStr.length());
     client.println("Connection: close");
     client.println();
     client.print(bodyStr);
 
-    HttpResponseMeta meta = {};
-    if (!read_http_headers(client, &meta)) {
-        client.stop();
-        return false;
-    }
-    if (meta.status_code < 200 || meta.status_code >= 300) {
+    HttpResponseMeta localMeta = {};
+    if (!read_http_headers(client, &localMeta)) {
         client.stop();
         return false;
     }
 
-    char* body = nullptr;
-    size_t bodyLen = 0;
-    bool ok = read_json_body(client, meta.chunked, &body, &bodyLen, 256 * 1024);
+    char* respBody = nullptr;
+    size_t respLen = 0;
+    bool ok = read_json_body(client, localMeta.chunked, &respBody, &respLen, 256 * 1024);
     client.stop();
-    if (!ok || !body) return false;
+    if (meta) *meta = localMeta;
+    if (!ok || !respBody) return false;
 
-    JsonDocument respDoc;
-    DeserializationError err = deserializeJson(respDoc, body, bodyLen);
-    if (err) {
-        heap_caps_free(body);
+    if (localMeta.status_code < 200 || localMeta.status_code >= 300) {
+        Serial.printf("[TTS] HTTP %d path=%s type=%s\n",
+                      localMeta.status_code, path,
+                      localMeta.content_type[0] ? localMeta.content_type : "(unknown)");
+        Serial.printf("[TTS] Error body: %.200s\n", respBody);
+        heap_caps_free(respBody);
         return false;
     }
-    heap_caps_free(body);
 
-    const char* audioB64 = respDoc["choices"][0]["message"]["audio"]["data"] | "";
-    if (!audioB64[0]) return false;
+    *body = respBody;
+    *bodyLen = respLen;
+    return true;
+}
 
-    size_t maxDecoded = (strlen(audioB64) * 3) / 4 + 4;
-    uint8_t* decoded = (uint8_t*)alloc_prefer_psram(maxDecoded);
-    if (!decoded) return false;
-
-    size_t decodedLen = 0;
-    if (mbedtls_base64_decode(decoded, maxDecoded, &decodedLen,
-                              (const unsigned char*)audioB64, strlen(audioB64)) != 0) {
-        heap_caps_free(decoded);
-        return false;
-    }
+static bool play_pcm_audio(const uint8_t* decoded, size_t decodedLen) {
+    if (!decoded || decodedLen < 2) return false;
 
     M5Cardputer.Speaker.stop();
     bool played = M5Cardputer.Speaker.playRaw((const int16_t*)decoded, decodedLen / 2,
@@ -827,6 +801,168 @@ bool llm_speak_text(const char* text) {
             delay(10);
         }
     }
-    heap_caps_free(decoded);
     return played;
+}
+
+static bool play_wav_audio(const uint8_t* data, size_t len) {
+    if (!data || len < 44) return false;
+    if (memcmp(data, "RIFF", 4) != 0 || memcmp(data + 8, "WAVE", 4) != 0) return false;
+
+    uint16_t audioFormat = 0;
+    uint16_t channels = 0;
+    uint32_t sampleRate = 0;
+    uint16_t bitsPerSample = 0;
+    const uint8_t* pcm = nullptr;
+    size_t pcmLen = 0;
+
+    size_t pos = 12;
+    while (pos + 8 <= len) {
+        const uint8_t* chunk = data + pos;
+        uint32_t chunkSize = (uint32_t)chunk[4]
+                           | ((uint32_t)chunk[5] << 8)
+                           | ((uint32_t)chunk[6] << 16)
+                           | ((uint32_t)chunk[7] << 24);
+        size_t chunkData = pos + 8;
+        if (chunkData + chunkSize > len) break;
+
+        if (memcmp(chunk, "fmt ", 4) == 0 && chunkSize >= 16) {
+            audioFormat = (uint16_t)data[chunkData] | ((uint16_t)data[chunkData + 1] << 8);
+            channels = (uint16_t)data[chunkData + 2] | ((uint16_t)data[chunkData + 3] << 8);
+            sampleRate = (uint32_t)data[chunkData + 4]
+                       | ((uint32_t)data[chunkData + 5] << 8)
+                       | ((uint32_t)data[chunkData + 6] << 16)
+                       | ((uint32_t)data[chunkData + 7] << 24);
+            bitsPerSample = (uint16_t)data[chunkData + 14] | ((uint16_t)data[chunkData + 15] << 8);
+        } else if (memcmp(chunk, "data", 4) == 0) {
+            pcm = data + chunkData;
+            pcmLen = chunkSize;
+            break;
+        }
+
+        pos = chunkData + chunkSize + (chunkSize & 1U);
+    }
+
+    if (!pcm || pcmLen < 2) return false;
+    if (audioFormat != 1 || bitsPerSample != 16 || sampleRate == 0) return false;
+
+    M5Cardputer.Speaker.stop();
+    bool played = M5Cardputer.Speaker.playRaw((const int16_t*)pcm, pcmLen / 2,
+                                              sampleRate, channels > 1, 1, -1, true);
+    if (played) {
+        unsigned long waitUntil = millis() + (pcmLen * 1000UL / 2 / sampleRate) + 1500;
+        while (M5Cardputer.Speaker.isPlaying() && millis() < waitUntil) {
+            delay(10);
+        }
+    }
+    return played;
+}
+
+static bool extract_audio_b64(const char* body, size_t bodyLen, String& audioB64) {
+    JsonDocument respDoc;
+    DeserializationError err = deserializeJson(respDoc, body, bodyLen);
+    if (err) return false;
+
+    const char* candidate = respDoc["choices"][0]["message"]["audio"]["data"] | "";
+    if (!candidate[0]) candidate = respDoc["choices"][0]["audio"]["data"] | "";
+    if (!candidate[0]) candidate = respDoc["audio"]["data"] | "";
+    if (!candidate[0]) candidate = respDoc["data"] | "";
+    if (!candidate[0]) return false;
+
+    audioB64 = candidate;
+    return true;
+}
+
+bool llm_speak_text(const char* text) {
+    if (!text || !text[0] || s_api_key[0] == '\0' || WiFi.status() != WL_CONNECTED) return false;
+
+    String clipped = text;
+    if (clipped.length() > M5CLAW_TTS_TEXT_MAX) {
+        clipped = clipped.substring(0, M5CLAW_TTS_TEXT_MAX);
+    }
+
+    auto tryPlayBody = [&](const HttpResponseMeta& meta, char* body, size_t bodyLen) -> bool {
+        if (!body || bodyLen == 0) return false;
+
+        bool isJson = str_contains_nocase(meta.content_type, "application/json");
+        if (!isJson) {
+            bool played = play_wav_audio((const uint8_t*)body, bodyLen);
+            if (!played) played = play_pcm_audio((const uint8_t*)body, bodyLen);
+            heap_caps_free(body);
+            return played;
+        }
+
+        String audioB64;
+        bool found = extract_audio_b64(body, bodyLen, audioB64);
+        heap_caps_free(body);
+        if (!found || audioB64.length() == 0) return false;
+
+        size_t maxDecoded = (audioB64.length() * 3) / 4 + 4;
+        uint8_t* decoded = (uint8_t*)alloc_prefer_psram(maxDecoded);
+        if (!decoded) return false;
+
+        size_t decodedLen = 0;
+        if (mbedtls_base64_decode(decoded, maxDecoded, &decodedLen,
+                                  (const unsigned char*)audioB64.c_str(), audioB64.length()) != 0) {
+            heap_caps_free(decoded);
+            return false;
+        }
+
+        bool played = play_wav_audio(decoded, decodedLen);
+        if (!played) played = play_pcm_audio(decoded, decodedLen);
+        heap_caps_free(decoded);
+        return played;
+    };
+
+    auto tryChatTts = [&](bool addModalities) -> bool {
+        JsonDocument doc;
+        doc["model"] = M5CLAW_MIMO_TTS_MODEL;
+        JsonArray msgs = doc["messages"].to<JsonArray>();
+        JsonObject msg = msgs.add<JsonObject>();
+        msg["role"] = "assistant";
+        msg["content"] = clipped;
+        if (addModalities) {
+            JsonArray modalities = doc["modalities"].to<JsonArray>();
+            modalities.add("audio");
+        }
+        JsonObject audio = doc["audio"].to<JsonObject>();
+        audio["format"] = "pcm16";
+        audio["voice"] = M5CLAW_MIMO_TTS_VOICE;
+        doc["stream"] = false;
+
+        String bodyStr;
+        bodyStr.reserve(1024);
+        serializeJson(doc, bodyStr);
+
+        HttpResponseMeta meta = {};
+        char* body = nullptr;
+        size_t bodyLen = 0;
+        if (!tts_post_json(llm_path(), bodyStr, &meta, &body, &bodyLen)) return false;
+        return tryPlayBody(meta, body, bodyLen);
+    };
+
+    auto tryAudioSpeech = [&]() -> bool {
+        JsonDocument doc;
+        doc["model"] = M5CLAW_MIMO_TTS_MODEL;
+        doc["input"] = clipped;
+        doc["voice"] = M5CLAW_MIMO_TTS_VOICE;
+        doc["format"] = "pcm16";
+        doc["response_format"] = "pcm16";
+
+        String bodyStr;
+        bodyStr.reserve(512);
+        serializeJson(doc, bodyStr);
+
+        HttpResponseMeta meta = {};
+        char* body = nullptr;
+        size_t bodyLen = 0;
+        if (!tts_post_json(M5CLAW_MIMO_TTS_PATH, bodyStr, &meta, &body, &bodyLen)) return false;
+        return tryPlayBody(meta, body, bodyLen);
+    };
+
+    if (tryChatTts(false)) return true;
+    if (tryChatTts(true)) return true;
+    if (tryAudioSpeech()) return true;
+
+    Serial.println("[TTS] No playable audio in response");
+    return false;
 }

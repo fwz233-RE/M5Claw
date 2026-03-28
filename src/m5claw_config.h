@@ -13,6 +13,7 @@
 #define M5CLAW_LLM_MAX_TOKENS          4096
 #define M5CLAW_MIMO_HOST               "api.xiaomimimo.com"
 #define M5CLAW_MIMO_CHAT_PATH          "/v1/chat/completions"
+#define M5CLAW_MIMO_TTS_PATH           "/v1/audio/speech"
 #define M5CLAW_MIMO_TTS_MODEL          "mimo-v2-tts"
 #define M5CLAW_MIMO_TTS_VOICE          "mimo_default"
 #define M5CLAW_MIMO_TTS_SAMPLE_RATE    24000
@@ -53,7 +54,7 @@
 // Cron Service
 #define M5CLAW_CRON_FILE               "/cron.json"
 #define M5CLAW_CRON_MAX_JOBS           8
-#define M5CLAW_CRON_CHECK_MS           (60 * 1000)
+#define M5CLAW_CRON_CHECK_MS           5000
 
 // Heartbeat
 #define M5CLAW_HEARTBEAT_FILE          "/HEARTBEAT.md"

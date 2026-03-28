@@ -10,6 +10,9 @@ static CronJob s_jobs[M5CLAW_CRON_MAX_JOBS];
 static int s_jobCount = 0;
 static TimerHandle_t s_timer = nullptr;
 
+static void scheduleNextCheck(uint32_t delayMs);
+static void rescheduleNextCheck(bool soon = false);
+
 static int compactJobs() {
     int active = 0;
     for (int i = 0; i < s_jobCount; i++) {
@@ -97,10 +100,75 @@ static int64_t nowEpoch() {
     return (int64_t)t;
 }
 
+static void scheduleNextCheck(uint32_t delayMs) {
+    if (!s_timer) return;
+    if (delayMs == 0) delayMs = 1000;
+
+    TickType_t ticks = pdMS_TO_TICKS(delayMs);
+    if (ticks == 0) ticks = 1;
+
+    xTimerStop(s_timer, 0);
+    xTimerChangePeriod(s_timer, ticks, 0);
+    xTimerStart(s_timer, 0);
+}
+
+static void rescheduleNextCheck(bool soon) {
+    if (!s_timer) return;
+
+    if (soon) {
+        scheduleNextCheck(1000);
+        return;
+    }
+
+    int enabledCount = countEnabledJobs();
+    if (enabledCount == 0) {
+        xTimerStop(s_timer, 0);
+        return;
+    }
+
+    int64_t now = nowEpoch();
+    if (now == 0) {
+        scheduleNextCheck(5000);
+        return;
+    }
+
+    int64_t earliest = 0;
+    for (int i = 0; i < s_jobCount; i++) {
+        CronJob& j = s_jobs[i];
+        if (!j.enabled) continue;
+
+        int64_t dueAt = 0;
+        if (j.kind == CRON_KIND_EVERY) {
+            if (j.nextRun <= 0) {
+                j.nextRun = now + j.intervalSec;
+            }
+            dueAt = j.nextRun;
+        } else {
+            dueAt = (j.lastRun == 0) ? j.atEpoch : 0;
+        }
+
+        if (dueAt <= 0) continue;
+        if (earliest == 0 || dueAt < earliest) earliest = dueAt;
+    }
+
+    if (earliest == 0) {
+        scheduleNextCheck(5000);
+        return;
+    }
+
+    int64_t delaySec = earliest - now;
+    if (delaySec < 1) delaySec = 1;
+    if (delaySec > 24 * 3600) delaySec = 24 * 3600;
+    scheduleNextCheck((uint32_t)delaySec * 1000U);
+}
+
 static void checkJobs(TimerHandle_t timer) {
     (void)timer;
     int64_t now = nowEpoch();
-    if (now == 0) return;
+    if (now == 0) {
+        scheduleNextCheck(5000);
+        return;
+    }
 
     bool needSave = false;
     for (int i = 0; i < s_jobCount; i++) {
@@ -137,7 +205,11 @@ static void checkJobs(TimerHandle_t timer) {
             Serial.printf("[CRON] Fired: %s\n", j.name);
         }
     }
-    if (needSave) saveJobs();
+    if (needSave) {
+        compactJobs();
+        saveJobs();
+    }
+    rescheduleNextCheck(false);
 }
 
 void CronService::init() {
@@ -149,10 +221,10 @@ void CronService::init() {
 void CronService::start() {
     if (s_timer) return;
     s_timer = xTimerCreate("cron", pdMS_TO_TICKS(M5CLAW_CRON_CHECK_MS),
-                           pdTRUE, nullptr, checkJobs);
+                           pdFALSE, nullptr, checkJobs);
     if (s_timer) {
-        xTimerStart(s_timer, 0);
         Serial.println("[CRON] Timer started");
+        rescheduleNextCheck(false);
     }
 }
 
@@ -174,6 +246,7 @@ bool CronService::addJob(CronJob* job) {
     }
     s_jobs[s_jobCount++] = *job;
     saveJobs();
+    rescheduleNextCheck(false);
     return true;
 }
 
@@ -183,6 +256,7 @@ bool CronService::removeJob(const char* jobId) {
             s_jobs[i].enabled = false;
             compactJobs();
             saveJobs();
+            rescheduleNextCheck(false);
             return true;
         }
     }

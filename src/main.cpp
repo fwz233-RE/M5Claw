@@ -20,6 +20,7 @@
 #include "heartbeat.h"
 #include "skill_loader.h"
 #include <esp_heap_caps.h>
+#include <esp_log.h>
 #include <freertos/queue.h>
 #include "soc/rtc_cntl_reg.h"
 
@@ -287,6 +288,7 @@ void dispatchOutbound() {
 
 void setup() {
     WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+    esp_log_level_set("ssl_client", ESP_LOG_NONE);
 
     auto cfg = M5.config();
     cfg.output_power = true;
@@ -390,13 +392,29 @@ void loop() {
                 chat.appendAIToken(agentResponseText);
             }
             chat.onAIResponseComplete();
-            if (s_playTtsForNextLocalReply) {
-                if (!speakReplyWithPause(agentResponseText)) {
+
+            bool shouldSpeak = s_playTtsForNextLocalReply && agentResponseText[0];
+            char ttsText[M5CLAW_TTS_TEXT_MAX * 4 + 1] = {0};
+            if (shouldSpeak) {
+                strlcpy(ttsText, agentResponseText, sizeof(ttsText));
+            }
+
+            free(agentResponseText);
+            agentResponseText = nullptr;
+            agentResponseReady = false;
+            s_hasStreamedTokens = false;
+            s_playTtsForNextLocalReply = false;
+
+            if (shouldSpeak) {
+                delay(20);
+                if (!speakReplyWithPause(ttsText)) {
                     companion.triggerIdle();
                 }
             } else {
                 companion.triggerIdle();
             }
+
+            return;
         }
         free(agentResponseText);
         agentResponseText = nullptr;

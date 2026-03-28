@@ -284,14 +284,6 @@ static void processRequest(AgentRequest& req, char* system_prompt, char* tool_ou
 
         Serial.printf("[AGENT] Tool iteration %d: %d calls\n", iteration + 1, resp.call_count);
 
-        if (req.tokenCallback) {
-            for (int i = 0; i < resp.call_count; i++) {
-                char status[64];
-                snprintf(status, sizeof(status), "\n[tool: %s]\n", resp.calls[i].name);
-                req.tokenCallback(status);
-            }
-        }
-
         if (messages == nullptr) {
             if (!restoreMessagesFromSwap(&messages)) {
                 if (!buildInitialMessages(sessionId, req, &messages)) {

@@ -7,6 +7,178 @@
 #include <SPIFFS.h>
 #include <time.h>
 
+static int64_t currentEpoch() {
+    struct tm ti;
+    if (!getLocalTime(&ti, 0)) return 0;
+    return (int64_t)mktime(&ti);
+}
+
+static bool parseDateTimeString(const char* text, int64_t* outEpoch) {
+    if (!text || !text[0] || !outEpoch) return false;
+
+    int year = 0, month = 0, day = 0;
+    int hour = 0, minute = 0, second = 0;
+    if (sscanf(text, "%d-%d-%dT%d:%d:%d", &year, &month, &day, &hour, &minute, &second) >= 5 ||
+        sscanf(text, "%d-%d-%d %d:%d:%d", &year, &month, &day, &hour, &minute, &second) >= 5 ||
+        sscanf(text, "%d/%d/%d %d:%d:%d", &year, &month, &day, &hour, &minute, &second) >= 5) {
+        struct tm tmv = {};
+        tmv.tm_year = year - 1900;
+        tmv.tm_mon = month - 1;
+        tmv.tm_mday = day;
+        tmv.tm_hour = hour;
+        tmv.tm_min = minute;
+        tmv.tm_sec = second;
+        time_t t = mktime(&tmv);
+        if (t <= 0) return false;
+        *outEpoch = (int64_t)t;
+        return true;
+    }
+
+    if (sscanf(text, "%d:%d:%d", &hour, &minute, &second) >= 2) {
+        struct tm nowTm;
+        if (!getLocalTime(&nowTm, 0)) return false;
+        nowTm.tm_hour = hour;
+        nowTm.tm_min = minute;
+        nowTm.tm_sec = second;
+        time_t t = mktime(&nowTm);
+        if (t <= 0) return false;
+        if ((int64_t)t <= currentEpoch()) {
+            nowTm.tm_mday += 1;
+            t = mktime(&nowTm);
+        }
+        if (t <= 0) return false;
+        *outEpoch = (int64_t)t;
+        return true;
+    }
+
+    return false;
+}
+
+static bool readEpochField(JsonDocument& doc, const char* key, int64_t* outEpoch) {
+    JsonVariant v = doc[key];
+    if (v.isNull() || !outEpoch) return false;
+
+    if (v.is<int64_t>() || v.is<long long>() || v.is<unsigned long long>() || v.is<double>()) {
+        int64_t epoch = v.as<int64_t>();
+        if (epoch > 100000000000LL) epoch /= 1000;
+        if (epoch <= 0) return false;
+        *outEpoch = epoch;
+        return true;
+    }
+
+    const char* s = v | "";
+    if (!s[0]) return false;
+    if (parseDateTimeString(s, outEpoch)) return true;
+
+    char* endPtr = nullptr;
+    long long epoch = strtoll(s, &endPtr, 10);
+    if (endPtr && *endPtr == '\0' && epoch > 0) {
+        if (epoch > 100000000000LL) epoch /= 1000;
+        *outEpoch = (int64_t)epoch;
+        return true;
+    }
+    return false;
+}
+
+static bool readDelaySeconds(JsonDocument& doc, uint32_t* outSeconds) {
+    if (!outSeconds) return false;
+
+    struct DelayField {
+        const char* key;
+        uint32_t factor;
+    };
+    static const DelayField kFields[] = {
+        {"delay_s", 1},
+        {"delay_sec", 1},
+        {"delay_seconds", 1},
+        {"after_s", 1},
+        {"after_seconds", 1},
+        {"delay_m", 60},
+        {"delay_min", 60},
+        {"delay_minutes", 60},
+        {"after_minutes", 60},
+        {"delay_h", 3600},
+        {"delay_hours", 3600},
+        {"after_hours", 3600},
+    };
+
+    for (const auto& field : kFields) {
+        JsonVariant v = doc[field.key];
+        if (v.isNull()) continue;
+        uint32_t base = v.as<uint32_t>();
+        if (base == 0) return false;
+        *outSeconds = base * field.factor;
+        return true;
+    }
+    return false;
+}
+
+static bool readIntervalSeconds(JsonDocument& doc, uint32_t* outSeconds) {
+    if (!outSeconds) return false;
+
+    struct IntervalField {
+        const char* key;
+        uint32_t factor;
+    };
+    static const IntervalField kFields[] = {
+        {"interval_s", 1},
+        {"interval_sec", 1},
+        {"interval_seconds", 1},
+        {"every_s", 1},
+        {"every_seconds", 1},
+        {"interval_m", 60},
+        {"interval_min", 60},
+        {"interval_minutes", 60},
+        {"every_minutes", 60},
+        {"interval_h", 3600},
+        {"interval_hours", 3600},
+        {"every_hours", 3600},
+    };
+
+    for (const auto& field : kFields) {
+        JsonVariant v = doc[field.key];
+        if (v.isNull()) continue;
+        uint32_t base = v.as<uint32_t>();
+        if (base == 0) return false;
+        *outSeconds = base * field.factor;
+        return true;
+    }
+    return false;
+}
+
+static bool inferScheduleType(JsonDocument& doc, const char** outType) {
+    if (!outType) return false;
+
+    const char* explicitType = doc["schedule_type"] | "";
+    if (explicitType[0]) {
+        *outType = explicitType;
+        return true;
+    }
+
+    int64_t epoch = 0;
+    if (readEpochField(doc, "at_epoch", &epoch) ||
+        readEpochField(doc, "run_at_epoch", &epoch) ||
+        readEpochField(doc, "timestamp", &epoch) ||
+        readEpochField(doc, "at", &epoch) ||
+        readEpochField(doc, "datetime", &epoch) ||
+        readEpochField(doc, "run_at", &epoch) ||
+        readEpochField(doc, "when", &epoch)) {
+        *outType = "at";
+        return true;
+    }
+
+    uint32_t seconds = 0;
+    if (readDelaySeconds(doc, &seconds)) {
+        *outType = "at";
+        return true;
+    }
+    if (readIntervalSeconds(doc, &seconds)) {
+        *outType = "every";
+        return true;
+    }
+    return false;
+}
+
 /* ── get_current_time ──────────────────────────────── */
 static bool tool_get_time(const char* input, char* output, size_t sz) {
     struct tm ti;
@@ -136,8 +308,8 @@ static bool tool_cron_add(const char* input, char* output, size_t sz) {
 
     CronJob job = {};
     const char* name = doc["name"] | "";
-    const char* schedType = doc["schedule_type"] | "every";
     const char* message = doc["message"] | "";
+    const char* schedType = "";
 
     const char* ctxCh = ToolRegistry::getCtxChannel();
     const char* ctxId = ToolRegistry::getCtxChatId();
@@ -145,6 +317,10 @@ static bool tool_cron_add(const char* input, char* output, size_t sz) {
     const char* chatId  = ctxId[0] ? ctxId : "cron";
 
     if (!name[0] || !message[0]) { strlcpy(output, "Missing name or message", sz); return false; }
+    if (!inferScheduleType(doc, &schedType)) {
+        strlcpy(output, "Missing schedule. Provide schedule_type plus at_epoch/interval_s, or use delay_s/delay_minutes.", sz);
+        return false;
+    }
 
     strlcpy(job.name, name, sizeof(job.name));
     strlcpy(job.message, message, sizeof(job.message));
@@ -152,14 +328,41 @@ static bool tool_cron_add(const char* input, char* output, size_t sz) {
     strlcpy(job.chatId, chatId, sizeof(job.chatId));
     job.enabled = true;
 
-    if (strcmp(schedType, "at") == 0) {
+    if (strcmp(schedType, "at") == 0 || strcmp(schedType, "once") == 0 || strcmp(schedType, "one_shot") == 0) {
         job.kind = CRON_KIND_AT;
-        job.atEpoch = doc["at_epoch"] | 0;
+        int64_t atEpoch = 0;
+        uint32_t delaySec = 0;
+        if (!readEpochField(doc, "at_epoch", &atEpoch) &&
+            !readEpochField(doc, "run_at_epoch", &atEpoch) &&
+            !readEpochField(doc, "timestamp", &atEpoch) &&
+            !readEpochField(doc, "at", &atEpoch) &&
+            !readEpochField(doc, "datetime", &atEpoch) &&
+            !readEpochField(doc, "run_at", &atEpoch) &&
+            !readEpochField(doc, "when", &atEpoch)) {
+            if (!readDelaySeconds(doc, &delaySec)) {
+                strlcpy(output, "Missing one-shot time. Provide at_epoch/at, or delay_s/delay_minutes.", sz);
+                return false;
+            }
+            int64_t now = currentEpoch();
+            if (now == 0) {
+                strlcpy(output, "Time not synced yet. Cannot schedule one-shot task.", sz);
+                return false;
+            }
+            atEpoch = now + delaySec;
+        }
+        int64_t now = currentEpoch();
+        if (now > 0 && atEpoch <= now) atEpoch = now + 1;
+        job.atEpoch = atEpoch;
         job.deleteAfterRun = true;
         if (job.atEpoch == 0) { strlcpy(output, "Missing at_epoch for one-shot job", sz); return false; }
     } else {
         job.kind = CRON_KIND_EVERY;
-        job.intervalSec = doc["interval_s"] | 3600;
+        uint32_t intervalSec = 0;
+        if (!readIntervalSeconds(doc, &intervalSec)) {
+            strlcpy(output, "Missing recurring interval. Provide interval_s/interval_minutes.", sz);
+            return false;
+        }
+        job.intervalSec = intervalSec;
         job.deleteAfterRun = false;
         if (job.intervalSec == 0) {
             strlcpy(output, "interval_s must be greater than 0", sz);
@@ -168,7 +371,11 @@ static bool tool_cron_add(const char* input, char* output, size_t sz) {
     }
 
     if (CronService::addJob(&job)) {
-        snprintf(output, sz, "Cron job '%s' added (id=%s)", name, job.id);
+        if (job.kind == CRON_KIND_AT) {
+            snprintf(output, sz, "Cron job '%s' added (id=%s, at_epoch=%lld)", name, job.id, (long long)job.atEpoch);
+        } else {
+            snprintf(output, sz, "Cron job '%s' added (id=%s, every_s=%u)", name, job.id, (unsigned)job.intervalSec);
+        }
     } else {
         strlcpy(output, "Failed to add cron job (time not synced, invalid schedule, or max jobs reached)", sz);
     }
@@ -264,7 +471,7 @@ static const ToolDef s_tools[] = {
     {
         "cron_add",
         "Schedule a recurring or one-shot task. Notification is automatically sent to the channel where this request originated.",
-        "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"Job name\"},\"schedule_type\":{\"type\":\"string\",\"description\":\"'every' for recurring or 'at' for one-shot\"},\"interval_s\":{\"type\":\"integer\",\"description\":\"Interval in seconds (for every)\"},\"at_epoch\":{\"type\":\"integer\",\"description\":\"Unix timestamp (for at)\"},\"message\":{\"type\":\"string\",\"description\":\"Message to trigger when job fires\"}},\"required\":[\"name\",\"message\"]}",
+        "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"Job name\"},\"schedule_type\":{\"type\":\"string\",\"description\":\"Use 'every' for recurring or 'at' for one-shot\"},\"interval_s\":{\"type\":\"integer\",\"description\":\"Recurring interval in seconds\"},\"interval_minutes\":{\"type\":\"integer\",\"description\":\"Recurring interval in minutes\"},\"at_epoch\":{\"type\":\"integer\",\"description\":\"One-shot Unix timestamp in seconds or milliseconds\"},\"delay_s\":{\"type\":\"integer\",\"description\":\"One-shot delay in seconds from now\"},\"delay_minutes\":{\"type\":\"integer\",\"description\":\"One-shot delay in minutes from now\"},\"at\":{\"type\":\"string\",\"description\":\"One-shot local time, e.g. 2026-03-28 21:30:00 or 21:30\"},\"message\":{\"type\":\"string\",\"description\":\"Message to trigger when job fires\"}},\"required\":[\"name\",\"message\"]}",
         tool_cron_add
     },
     {

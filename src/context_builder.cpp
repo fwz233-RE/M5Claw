@@ -40,7 +40,8 @@ void ContextBuilder::buildSystemPrompt(char* buf, size_t bufSize) {
         "- cron_remove: Remove a cron job by ID.\n"
         "- wechat_send: Send a message to a WeChat user proactively.\n"
         "- Built-in MiMo web_search is available for current information when needed.\n\n"
-        "cron_add automatically delivers notifications back to the channel and chat where the request originated.\n\n");
+        "cron_add automatically delivers notifications back to the channel and chat where the request originated.\n"
+        "For cron_add, do not omit timing fields: use at_epoch or delay_s/delay_minutes for one-shot reminders, and interval_s/interval_minutes for recurring tasks.\n\n");
 
     // Memory
     off += snprintf(buf + off, bufSize - off,
